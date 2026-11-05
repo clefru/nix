@@ -447,7 +447,10 @@ std::map<std::string, std::optional<StorePath>> Store::queryStaticPartialDerivat
     std::map<std::string, std::optional<StorePath>> outputs;
     auto drv = readInvalidDerivation(path);
     for (auto & [outputName, output] : outputsAndOptPaths(drv, *this)) {
-        outputs.emplace(outputName, output.second);
+        if (output.second)
+            outputs.emplace(outputName, resolveInputPath(*output.second));
+        else
+            outputs.emplace(outputName, std::nullopt);
     }
     return outputs;
 }
@@ -460,7 +463,9 @@ Store::queryStaticPartialDerivationOutput(const StorePath & path, const std::str
     auto it = outputs.find(outputName);
     if (it == outputs.end())
         throw Error("derivation '%s' does not have an output named '%s'", printStorePath(path), outputName);
-    return it->second.second;
+    if (it->second.second)
+        return resolveInputPath(*it->second.second);
+    return std::nullopt;
 }
 
 std::map<std::string, std::optional<StorePath>>
@@ -469,6 +474,10 @@ Store::queryPartialDerivationOutputMap(const StorePath & path, Store * evalStore
     auto & evalStore = evalStore_ ? *evalStore_ : *this;
 
     auto outputs = evalStore.queryStaticPartialDerivationOutputMap(path);
+    for (auto & [outputName, optPath] : outputs) {
+        if (optPath)
+            optPath = resolveInputPath(*optPath);
+    }
 
     if (!experimentalFeatureSettings.isEnabled(Xp::CaDerivations))
         return outputs;

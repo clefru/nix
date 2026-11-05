@@ -95,6 +95,17 @@ protected:
         return store->toRealPath(p);
     }
 
+    /**
+     * Execute `$out/nix-support/relocate.sh <target-dir> <old-hash> <new-hash>`
+     * inside the builder environment / sandbox.
+     */
+    virtual void runRelocateScript(
+        const StorePath & scratchPath,
+        std::string_view oldHash,
+        std::string_view newHash)
+    {
+    }
+
 
 public:
 

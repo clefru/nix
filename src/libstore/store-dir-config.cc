@@ -100,6 +100,11 @@ StorePath StoreDirConfig::makeOutputPath(std::string_view id, const Hash & hash,
     return makeStorePath("output:" + std::string{id}, hash, outputPathName(name, id));
 }
 
+StorePath StoreDirConfig::makeContentAddressedOutputPath(const Hash & narHash, std::string_view name) const
+{
+    return StorePath(compressHash(narHash, 20), name);
+}
+
 /* Stuff the references (if any) into the type.  This is a bit
    hacky, but we can't put them in, say, <s2> (per the grammar above)
    since that would be ambiguous. */

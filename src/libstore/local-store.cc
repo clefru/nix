@@ -120,6 +120,10 @@ struct LocalStore::State::Stmts
     SQLiteStmt QueryRealisedOutput;
     SQLiteStmt QueryPathFromHashPart;
     SQLiteStmt QueryValidPaths;
+    SQLiteStmt AddPathRewrite;
+    SQLiteStmt QueryPathRewrite;
+    SQLiteStmt QueryAllPathRewrites;
+    bool hasPathRewrites = false;
 };
 
 LocalStore::LocalStore(ref<const Config> config)
@@ -374,6 +378,21 @@ LocalStore::LocalStore(ref<const Config> config)
     // ensure efficient lookup.
     state->stmts->QueryPathFromHashPart.create(state->db, "select path from ValidPaths where path >= ? limit 1;");
     state->stmts->QueryValidPaths.create(state->db, "select path from ValidPaths");
+    {
+        SQLiteStmt checkPathRewrites;
+        checkPathRewrites.create(
+            state->db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='PathRewrites';");
+        auto useCheck(checkPathRewrites.use());
+        if (useCheck.next()) {
+            state->stmts->hasPathRewrites = true;
+            state->stmts->AddPathRewrite.create(
+                state->db, "insert or replace into PathRewrites (inputPath, outputPath) values (?, ?);");
+            state->stmts->QueryPathRewrite.create(
+                state->db, "select outputPath from PathRewrites where inputPath = ?;");
+            state->stmts->QueryAllPathRewrites.create(
+                state->db, "select inputPath, outputPath from PathRewrites;");
+        }
+    }
     if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations)) {
         state->stmts->RegisterRealisedOutput.create(
             state->db,
@@ -654,6 +673,11 @@ bool LocalStore::upgradeDBSchema(State & state, bool dryRun)
 
     maybeUpgrade("20260309-drop-redundant-indexreferrer", "drop index if exists IndexReferrer");
 
+    maybeUpgrade(
+        "20261105-casper-path-rewrites",
+        "create table if not exists PathRewrites (inputPath text primary key not null, outputPath text not null);\n"
+        "create index if not exists IndexPathRewritesOutput on PathRewrites(outputPath)");
+
     return ret;
 }
 
@@ -734,6 +758,83 @@ void LocalStore::cacheDrvOutputMapping(
     });
 }
 
+void LocalStore::addPathRewrite(
+    const StorePath & inputPath,
+    const StorePath & outputPath,
+    std::optional<StorePath> drvPath,
+    std::optional<std::string> outputName)
+{
+    retrySQLite<void>([&]() {
+        auto state(_state->lock());
+        if (!state->stmts->hasPathRewrites)
+            return;
+        SQLiteTxn txn(state->db);
+        state->stmts->AddPathRewrite.use()
+            .apply(printStorePath(inputPath))
+            .apply(printStorePath(outputPath))
+            .exec();
+        if (drvPath && outputName && isValidPath_(*state, *drvPath)) {
+            auto drvId = queryValidPathId(*state, *drvPath);
+            state->stmts->AddDerivationOutput.use()
+                .apply(drvId)
+                .apply(*outputName)
+                .apply(printStorePath(outputPath))
+                .exec();
+        }
+        txn.commit();
+    });
+}
+
+std::optional<StorePath> LocalStore::queryPathRewrite_(State & state, const StorePath & inputPath)
+{
+    if (!state.stmts->hasPathRewrites)
+        return std::nullopt;
+    auto use(state.stmts->QueryPathRewrite.use().apply(printStorePath(inputPath)));
+    if (!use.next())
+        return std::nullopt;
+    return parseStorePath(use.getStr(0));
+}
+
+StorePath LocalStore::resolveInputPath_(State & state, const StorePath & path)
+{
+    if (auto rewritten = queryPathRewrite_(state, path))
+        return *rewritten;
+    return path;
+}
+
+std::optional<StorePath> LocalStore::queryPathRewrite(const StorePath & inputPath)
+{
+    return retrySQLite<std::optional<StorePath>>([&]() {
+        auto state(_state->lock());
+        return queryPathRewrite_(*state, inputPath);
+    });
+}
+
+StorePath LocalStore::resolveInputPath(const StorePath & path)
+{
+    if (auto rewritten = queryPathRewrite(path))
+        return *rewritten;
+    return path;
+}
+
+StringMap LocalStore::queryAllPathRewrites()
+{
+    return retrySQLite<StringMap>([&]() {
+        auto state(_state->lock());
+        StringMap res;
+        if (!state->stmts->hasPathRewrites)
+            return res;
+        auto use(state->stmts->QueryAllPathRewrites.use());
+        while (use.next()) {
+            auto inPath = parseStorePath(use.getStr(0));
+            auto outPath = parseStorePath(use.getStr(1));
+            if (inPath != outPath)
+                res.insert_or_assign(std::string(inPath.hashPart()), std::string(outPath.hashPart()));
+        }
+        return res;
+    });
+}
+
 uint64_t LocalStore::addValidPath(State & state, const ValidPathInfo & info)
 {
     if (info.ca.has_value() && !info.isContentAddressed(*this))
@@ -771,7 +872,7 @@ uint64_t LocalStore::addValidPath(State & state, const ValidPathInfo & info)
             /* Floating CA derivations have indeterminate output paths until
                they are built, so don't register anything in that case */
             if (i.second.second)
-                cacheDrvOutputMapping(state, id, i.first, *i.second.second);
+                cacheDrvOutputMapping(state, id, i.first, resolveInputPath_(state, *i.second.second));
         }
     }
 
@@ -928,7 +1029,8 @@ LocalStore::queryStaticPartialDerivationOutputMap(const StorePath & path)
         drvId = queryValidPathId(*state, path);
         auto use(state->stmts->QueryDerivationOutputs.use().apply(drvId));
         while (use.next())
-            outputs.insert_or_assign(use.getStr(0), parseStorePath(use.getStr(1)));
+            outputs.insert_or_assign(
+                use.getStr(0), resolveInputPath_(*state, parseStorePath(use.getStr(1))));
 
         return outputs;
     });

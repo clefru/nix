@@ -84,6 +84,8 @@ struct StoreDirConfig
 
     StorePath makeOutputPath(std::string_view id, const Hash & hash, std::string_view name) const;
 
+    StorePath makeContentAddressedOutputPath(const Hash & narHash, std::string_view name) const;
+
     StorePath makeFixedOutputPath(std::string_view name, const FixedOutputInfo & info) const;
 
     StorePath makeFixedOutputPathFromCA(std::string_view name, const ContentAddressWithReferences & ca) const;

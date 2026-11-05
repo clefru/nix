@@ -468,6 +468,15 @@ public:
     void cacheDrvOutputMapping(
         State & state, const uint64_t deriver, const std::string & outputName, const StorePath & output);
 
+    void addPathRewrite(
+        const StorePath & inputPath,
+        const StorePath & outputPath,
+        std::optional<StorePath> drvPath = std::nullopt,
+        std::optional<std::string> outputName = std::nullopt);
+    std::optional<StorePath> queryPathRewrite(const StorePath & inputPath);
+    StorePath resolveInputPath(const StorePath & path) override;
+    StringMap queryAllPathRewrites() override;
+
     std::optional<const UnkeyedRealisation> queryRealisation_(State & state, const DrvOutput & id);
     std::optional<std::pair<int64_t, UnkeyedRealisation>> queryRealisationCore_(State & state, const DrvOutput & id);
     void queryRealisationUncached(
@@ -541,6 +550,8 @@ private:
     // Internal versions that are not wrapped in retry_sqlite.
     bool isValidPath_(State & state, const StorePath & path);
     void queryReferrers(State & state, const StorePath & path, StorePathSet & referrers);
+    std::optional<StorePath> queryPathRewrite_(State & state, const StorePath & inputPath);
+    StorePath resolveInputPath_(State & state, const StorePath & path);
 
     void addBuildLog(const StorePath & drvPath, std::string_view log) override;
 

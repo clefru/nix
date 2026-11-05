@@ -163,6 +163,8 @@ static std::optional<StorePath> deepQueryPartialDerivationOutputImpl(
     auto & evalStore = evalStore_ ? *evalStore_ : store;
 
     auto staticResult = evalStore.queryStaticPartialDerivationOutput(drvPath, outputName);
+    if (staticResult)
+        staticResult = store.resolveInputPath(*staticResult);
     if (staticResult || !experimentalFeatureSettings.isEnabled(Xp::CaDerivations))
         return staticResult;
 

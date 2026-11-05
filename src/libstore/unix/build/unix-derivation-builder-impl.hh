@@ -254,6 +254,11 @@ protected:
 
     void addDependencyImpl(const StorePath & path) override;
 
+    void runRelocateScript(
+        const StorePath & scratchPath,
+        std::string_view oldHash,
+        std::string_view newHash) override;
+
     /**
      * Make a file owned by the builder.
      *

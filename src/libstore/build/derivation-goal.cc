@@ -90,7 +90,7 @@ Goal::Co<BuildResult> DerivationGoal::haveDerivation(bool storeDerivation)
         /* We are first going to try to create the invalid output paths
            through substitutes.  If that doesn't work, we'll build
            them. */
-        if (worker.settings.useSubstitutes && drvOptions.substitutesAllowed(worker.settings)) {
+        if (worker.settings.useSubstitutes && drvOptions.substitutesAllowed(worker.settings) && type(*drv).isCA()) {
             if (!checkResult) {
                 DrvOutput id{drvPath, wantedOutput};
                 auto g = worker.makeDrvOutputSubstitutionGoal(id);
@@ -238,19 +238,41 @@ Goal::Co<BuildResult> DerivationGoal::haveDerivation(bool storeDerivation)
 
     /* Project down to the `BasicDerivation` the builder consumes,
        adding the outputs of the input derivations to the input
-       sources. */
-    auto resolvedDrv = make_ref<const BasicDerivation>(drv->mapInputs([&](const std::set<SingleDerivedPath> & inputs) {
+       sources, and rewriting CASPER-relocated input-addressed dependencies. */
+    StringMap depRewrites = worker.store.queryAllPathRewrites();
+    BasicDerivation resolvedDrvMut = drv->mapInputs([&](const std::set<SingleDerivedPath> & inputs) {
         StorePathSet srcs;
         for (auto & input : inputs)
             std::visit(
                 overloaded{
-                    [&](const SingleDerivedPath::Opaque & op) { srcs.insert(op.path); },
+                    [&](const SingleDerivedPath::Opaque & op) {
+                        auto resolvedPath = worker.store.resolveInputPath(op.path);
+                        if (resolvedPath != op.path)
+                            depRewrites.insert_or_assign(
+                                std::string(op.path.hashPart()), std::string(resolvedPath.hashPart()));
+                        srcs.insert(resolvedPath);
+                    },
                     [&](const SingleDerivedPath::Built & built) {
                         auto depDrvPath = std::visit(
                             overloaded{
                                 [&](const SingleDerivedPath::Opaque & op) { return op.path; },
                                 [&](const SingleDerivedPath::Built &) -> StorePath { std::abort(); }},
                             built.drvPath->raw());
+                        for (auto * drvStore : {&worker.evalStore, &worker.store}) {
+                            if (drvStore->isValidPath(depDrvPath)) {
+                                auto depDrv = drvStore->readInvalidDerivation(depDrvPath);
+                                if (auto outSpec = get(depDrv.outputs, built.output)) {
+                                    if (auto origPath = outSpec->path(*drvStore, depDrv.name, built.output)) {
+                                        auto resolvedPath = worker.store.resolveInputPath(*origPath);
+                                        if (resolvedPath != *origPath)
+                                            depRewrites.insert_or_assign(
+                                                std::string(origPath->hashPart()),
+                                                std::string(resolvedPath.hashPart()));
+                                    }
+                                }
+                                break;
+                            }
+                        }
                         auto outMap = [&] {
                             for (auto * drvStore : {&worker.evalStore, &worker.store})
                                 if (drvStore->isValidPath(depDrvPath))
@@ -269,7 +291,14 @@ Goal::Co<BuildResult> DerivationGoal::haveDerivation(bool storeDerivation)
                     }},
                 input.raw());
         return srcs;
-    }));
+    });
+    for (auto & [outName, outSpec] : drv->outputs) {
+        if (auto origOutPath = outSpec.path(worker.store, drv->name, outName))
+            depRewrites.erase(std::string(origOutPath->hashPart()));
+    }
+    if (!depRewrites.empty())
+        resolvedDrvMut.applyRewrites(depRewrites);
+    auto resolvedDrv = make_ref<const BasicDerivation>(std::move(resolvedDrvMut));
 
     if (storeDerivation) {
         assert(std::ranges::none_of(drv->inputs, [](const auto & input) {
@@ -350,7 +379,7 @@ Goal::Co<BuildResult> DerivationGoal::repairClosure()
 
         OutputPathMap res;
         for (auto & [name, output] : outputsAndOptPaths(*drv, worker.store))
-            res.insert_or_assign(name, *output.second);
+            res.insert_or_assign(name, worker.store.resolveInputPath(*output.second));
         return res;
     }();
 
@@ -429,7 +458,7 @@ std::optional<std::pair<UnkeyedRealisation, PathStatus>> DerivationGoal::checkPa
     if (auto * mOutput = get(drv->outputs, wantedOutput)) {
         if (auto mPath = mOutput->path(worker.store, drv->name, wantedOutput)) {
             mRealisation = UnkeyedRealisation{
-                .outPath = std::move(*mPath),
+                .outPath = worker.store.resolveInputPath(*mPath),
             };
         }
     } else {

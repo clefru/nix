@@ -293,20 +293,30 @@ std::optional<Descriptor> UnixDerivationBuilderImpl::startBuild()
            corresponding to the valid outputs, and rewrite the
            contents of the new outputs to replace the dummy strings
            with the actual hashes. */
-        auto scratchPath = !status.known ? makeFallbackPath(outputName)
+        std::optional<StorePath> basePath = status.known ? std::optional{status.known->path} : std::nullopt;
+        bool isPresentOnDisk = status.known && status.known->isPresent();
+        bool isValidInStore = status.known && status.known->isValid();
+        if (auto outSpec = get(drv.outputs, outputName)) {
+            if (auto * ia = std::get_if<DerivationOutput::InputAddressed>(&outSpec->raw)) {
+                basePath = ia->path;
+                isPresentOnDisk = pathExists(store->toRealPath(ia->path));
+                isValidInStore = (status.known && status.known->path == ia->path) ? status.known->isValid() : false;
+            }
+        }
+        auto scratchPath = !basePath ? makeFallbackPath(outputName)
                            : !needsHashRewrite()
                                /* Can always use original path in sandbox */
-                               ? status.known->path
-                               : !status.known->isPresent()
+                               ? *basePath
+                               : !isPresentOnDisk
                                      /* If path doesn't yet exist can just use it */
-                                     ? status.known->path
-                                     : buildMode != bmRepair && !status.known->isValid()
+                                     ? *basePath
+                                     : buildMode != bmRepair && !isValidInStore
                                            /* If we aren't repairing we'll delete a corrupted path, so we
                                               can use original path */
-                                           ? status.known->path
+                                           ? *basePath
                                            : /* If we are repairing or the path is totally valid, we'll need
                                                 to use a temporary path */
-                                           makeFallbackPath(status.known->path);
+                                           makeFallbackPath(*basePath);
         scratchOutputs.insert_or_assign(outputName, scratchPath);
 
         /* Substitute output placeholders with the scratch output paths.
@@ -314,9 +324,9 @@ std::optional<Descriptor> UnixDerivationBuilderImpl::startBuild()
         inputRewrites[hashPlaceholder(outputName)] = store->printStorePath(scratchPath);
 
         /* Additional tasks if we know the final path a priori. */
-        if (!status.known)
+        if (!basePath)
             continue;
-        auto fixedFinalPath = status.known->path;
+        auto fixedFinalPath = *basePath;
 
         /* Additional tasks if the final and scratch are both known and
            differ. */
@@ -973,6 +983,65 @@ void UnixDerivationBuilderImpl::setUser()
 void UnixDerivationBuilderImpl::execBuilder(const Strings & args, const Strings & envStrs)
 {
     execve(requireCString(drv.builder), stringsToCharPtrs(args).data(), stringsToCharPtrs(envStrs).data());
+}
+
+void UnixDerivationBuilderImpl::runRelocateScript(
+    const StorePath & scratchPath,
+    std::string_view oldHash,
+    std::string_view newHash)
+{
+    if (oldHash.empty() || oldHash == newHash)
+        return;
+
+    auto targetDir = realPathInHost(scratchPath);
+    auto scriptPath = targetDir / "nix-support" / "relocate.sh";
+    if (!pathExists(scriptPath))
+        return;
+
+    Pid child(startProcess([&]() {
+        try {
+            setUser();
+
+            Strings envStrs;
+            bool hasPath = false;
+            std::string extraPath;
+            if (!drv.isBuiltin() && drv.builder.starts_with("/"))
+                extraPath = std::filesystem::path(drv.builder).parent_path().native();
+
+            for (auto & i : env) {
+                std::string val = rewriteStrings(i.second, inputRewrites);
+                if (i.first == "PATH") {
+                    hasPath = true;
+                    if (!extraPath.empty())
+                        val += ":" + extraPath;
+                }
+                envStrs.push_back(i.first + "=" + val);
+            }
+            if (!hasPath && !extraPath.empty())
+                envStrs.push_back("PATH=" + extraPath);
+
+            std::string shell = "/bin/sh";
+            if (!pathExists(shell) && !drv.isBuiltin()
+                && (hasSuffix(drv.builder, "/sh") || hasSuffix(drv.builder, "/bash")
+                    || hasSuffix(drv.builder, "/ash") || hasSuffix(drv.builder, "/dash"))
+                && pathExists(drv.builder)) {
+                shell = drv.builder;
+            }
+
+            Strings args{
+                "sh",
+                scriptPath.native(),
+                targetDir.native(),
+                std::string(oldHash),
+                std::string(newHash),
+            };
+            execve(shell.c_str(), stringsToCharPtrs(args).data(), stringsToCharPtrs(envStrs).data());
+        } catch (...) {
+        }
+        _exit(1);
+    }));
+
+    child.wait();
 }
 
 void UnixDerivationBuilderImpl::cleanupBuild(bool force)

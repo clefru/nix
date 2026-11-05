@@ -266,7 +266,7 @@ MissingPaths Store::queryMissing(const std::vector<DerivedPath> & targets)
                     }
 
                     if (knownOutputPaths && settings.getWorkerSettings().useSubstitutes
-                        && drvOptions.substitutesAllowed(settings.getWorkerSettings())) {
+                        && drvOptions.substitutesAllowed(settings.getWorkerSettings()) && type(*drv).isCA()) {
                         bool mustBuild = false;
                         StorePathSet substitutable;
                         auto * cap = getDerivationCA(*drv);

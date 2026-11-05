@@ -955,10 +955,15 @@ void ChrootLinuxDerivationBuilder::setUser()
 
 BuilderExit ChrootLinuxDerivationBuilder::unprepareBuild()
 {
+    return UnixDerivationBuilderImpl::unprepareBuild();
+}
+
+void ChrootLinuxDerivationBuilder::cleanupBuild(bool force)
+{
     sandboxMountNamespace = -1;
     sandboxUserNamespace = -1;
 
-    return UnixDerivationBuilderImpl::unprepareBuild();
+    ChrootDerivationBuilder::cleanupBuild(force);
 }
 
 void ChrootLinuxDerivationBuilder::killSandbox(bool getStats)
@@ -1005,6 +1010,81 @@ void ChrootLinuxDerivationBuilder::addDependencyImpl(const StorePath & path)
     int status = child.wait();
     if (!statusOk(status))
         throw Error("could not add path '%s' to sandbox: %s", store->printStorePath(path), statusToString(status));
+}
+
+void ChrootLinuxDerivationBuilder::runRelocateScript(
+    const StorePath & scratchPath,
+    std::string_view oldHash,
+    std::string_view newHash)
+{
+    if (oldHash.empty() || oldHash == newHash)
+        return;
+
+    if (sandboxMountNamespace.get() == -1) {
+        UnixDerivationBuilderImpl::runRelocateScript(scratchPath, oldHash, newHash);
+        return;
+    }
+
+    auto hostScriptPath = realPathInHost(scratchPath) / "nix-support" / "relocate.sh";
+    if (!pathExists(hostScriptPath))
+        return;
+
+    Pid child(startProcess([&]() {
+        try {
+            if (usingUserNamespace && (setns(sandboxUserNamespace.get(), CLONE_NEWUSER) == -1))
+                _exit(1);
+            if (setns(sandboxMountNamespace.get(), CLONE_NEWNS) == -1)
+                _exit(1);
+            if (chdir(chrootRootDir.c_str()) == -1)
+                _exit(1);
+            if (chroot(".") == -1)
+                _exit(1);
+
+            setUser();
+
+            auto targetDir = store->printStorePath(scratchPath);
+            auto scriptInSandbox = targetDir + "/nix-support/relocate.sh";
+
+            Strings envStrs;
+            bool hasPath = false;
+            std::string extraPath;
+            if (!drv.isBuiltin() && drv.builder.starts_with("/"))
+                extraPath = std::filesystem::path(drv.builder).parent_path().native();
+
+            for (auto & i : env) {
+                std::string val = rewriteStrings(i.second, inputRewrites);
+                if (i.first == "PATH") {
+                    hasPath = true;
+                    if (!extraPath.empty())
+                        val += ":" + extraPath;
+                }
+                envStrs.push_back(i.first + "=" + val);
+            }
+            if (!hasPath && !extraPath.empty())
+                envStrs.push_back("PATH=" + extraPath);
+
+            std::string shell = "/bin/sh";
+            if (!pathExists(shell) && !drv.isBuiltin()
+                && (hasSuffix(drv.builder, "/sh") || hasSuffix(drv.builder, "/bash")
+                    || hasSuffix(drv.builder, "/ash") || hasSuffix(drv.builder, "/dash"))
+                && pathExists(drv.builder)) {
+                shell = drv.builder;
+            }
+
+            Strings args{
+                "sh",
+                scriptInSandbox,
+                targetDir,
+                std::string(oldHash),
+                std::string(newHash),
+            };
+            execve(shell.c_str(), stringsToCharPtrs(args).data(), stringsToCharPtrs(envStrs).data());
+        } catch (...) {
+        }
+        _exit(1);
+    }));
+
+    child.wait();
 }
 
 } // namespace nix

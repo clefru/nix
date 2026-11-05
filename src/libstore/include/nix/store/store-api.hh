@@ -761,6 +761,23 @@ public:
     }
 
     /**
+     * Resolve an input-addressed store path to its content-addressed
+     * output path if it has been rewritten by CASPER.
+     */
+    virtual StorePath resolveInputPath(const StorePath & path)
+    {
+        return path;
+    }
+
+    /**
+     * Return all recorded CASPER path rewrites as a map of oldHashPart -> newHashPart.
+     */
+    virtual StringMap queryAllPathRewrites()
+    {
+        return {};
+    }
+
+    /**
      * Write a NAR dump of a store path.
      */
     virtual void narFromPath(const StorePath & path, Sink & sink);

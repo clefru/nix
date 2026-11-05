@@ -178,7 +178,15 @@ void checkOutputs(
                 for (auto & i : value) {
                     std::visit(
                         overloaded{
-                            [&](const StorePath & path) { spec.insert(path); },
+                            [&](const StorePath & path) {
+                                spec.insert(store.resolveInputPath(path));
+                                for (auto & [outName, outSpec] : drv.outputs) {
+                                    if (auto optP = outSpec.path(store, drv.name, outName); optP && *optP == path) {
+                                        if (auto outInfo = get(outputs, outName))
+                                            spec.insert(outInfo->path);
+                                    }
+                                }
+                            },
                             [&](const OutputName & refOutputName) {
                                 if (auto output = get(outputs, refOutputName))
                                     spec.insert(output->path);

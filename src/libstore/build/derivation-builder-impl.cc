@@ -103,6 +103,145 @@ static void replaceValidPath(const std::filesystem::path & storePath, const std:
         deletePath(oldPath);
 }
 
+static constexpr std::string_view defaultRelocateScript = R"sh(#!/bin/sh
+export LC_ALL=C
+target="$1"
+old="$2"
+new="$3"
+if [ -z "$target" ] || [ -z "$old" ] || [ -z "$new" ] || [ "$old" = "$new" ]; then
+    exit 0
+fi
+
+# 1. Decompress, rewrite, and deterministically recompress gzip files containing old hash
+find "$target" -type f -name '*.gz' 2>/dev/null | while IFS= read -r f; do
+    if gzip -dc "$f" 2>/dev/null | grep -q "$old" 2>/dev/null; then
+        chmod u+w "$(dirname "$f")" "$f" 2>/dev/null || true
+        if gzip -dc "$f" 2>/dev/null | sed "s|$old|$new|g" | gzip -n > "$f.tmp"; then
+            cat "$f.tmp" > "$f"
+        fi
+        rm -f "$f.tmp"
+    fi
+done
+
+# 2. Rewrite regular files containing old hash in-place (preserving permissions)
+find "$target" -type f ! -name '*.gz' -exec grep -l "$old" {} + 2>/dev/null | while IFS= read -r f; do
+    chmod u+w "$(dirname "$f")" "$f" 2>/dev/null || true
+    if sed "s|$old|$new|g" "$f" > "$f.tmp" 2>/dev/null; then
+        cat "$f.tmp" > "$f"
+    fi
+    rm -f "$f.tmp"
+done
+
+# 3. Rewrite symlinks whose target contains old hash
+find "$target" -type l 2>/dev/null | while IFS= read -r l; do
+    lnk=$(readlink "$l" 2>/dev/null) || continue
+    case "$lnk" in
+        *"$old"*)
+            newlnk=$(printf '%s\n' "$lnk" | sed "s|$old|$new|g")
+            chmod u+w "$(dirname "$l")" 2>/dev/null || true
+            ln -snf "$newlnk" "$l" 2>/dev/null || true
+            ;;
+    esac
+done
+)sh";
+
+static constexpr std::string_view defaultHashScript = R"sh(#!/bin/sh
+export LC_ALL=C
+set -e
+if [ "$1" = "--blind-in-place" ]; then
+    target="$2"
+    old_self="$3"
+    blind_self="$4"
+    exec "$target/nix-support/relocate.sh" "$target" "$old_self" "$blind_self"
+fi
+
+target="${1:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}"
+base="${2:-$(basename -- "$target")}"
+name="${base#????????????????????????????????-}"
+blind="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-$name"
+
+tmpdir=$(mktemp -d)
+trap 'chmod -R u+w "$tmpdir" 2>/dev/null || true; rm -rf "$tmpdir"' EXIT
+cp -a "$target" "$tmpdir/$base"
+chmod -R u+w "$tmpdir/$base" 2>/dev/null || true
+"$target/nix-support/relocate.sh" "$tmpdir/$base" "$base" "$blind"
+"${NIX_HASH_BIN:-nix-hash}" --type sha256 --truncate --base32 "$tmpdir/$base"
+)sh";
+
+static void preparePathForRelocation(
+    const std::filesystem::path & path,
+    std::optional<std::pair<uid_t, gid_t>> owner)
+{
+    auto st = lstat(path);
+#ifndef _WIN32
+    if (owner) {
+        if (lchown(path.c_str(), owner->first, owner->second) == -1)
+            throw SysError("changing owner of %1% for relocation", PathFmt(path));
+    }
+#endif
+    if (!S_ISLNK(st.st_mode)) {
+        chmod(path, (st.st_mode & ~S_IFMT) | S_IWUSR);
+    }
+    if (S_ISDIR(st.st_mode)) {
+        for (auto & entry : DirectoryIterator{path})
+            preparePathForRelocation(entry.path(), owner);
+    }
+}
+
+static bool hasGzFiles(const std::filesystem::path & path)
+{
+    auto st = lstat(path);
+    if (S_ISREG(st.st_mode))
+        return path.extension() == ".gz";
+    if (S_ISDIR(st.st_mode)) {
+        for (auto & entry : DirectoryIterator{path})
+            if (hasGzFiles(entry.path()))
+                return true;
+    }
+    return false;
+}
+
+static void rewritePathInPlace(
+    const std::filesystem::path & path,
+    std::string_view oldHash,
+    std::string_view newHash)
+{
+    if (oldHash.empty() || oldHash == newHash)
+        return;
+
+    auto st = lstat(path);
+    if (S_ISLNK(st.st_mode)) {
+        auto target = readLink(path).native();
+        if (target.find(oldHash) != std::string::npos) {
+            auto newTarget = rewriteStrings(target, StringMap{{std::string(oldHash), std::string(newHash)}});
+            auto parent = path.parent_path();
+            if (!parent.empty()) {
+                auto pst = lstat(parent);
+                chmod(parent, (pst.st_mode & ~S_IFMT) | S_IWUSR);
+            }
+            std::filesystem::remove(path);
+            createSymlink(newTarget, path);
+        }
+    } else if (S_ISREG(st.st_mode)) {
+        if (path.extension() == ".gz")
+            return;
+        auto content = readFile(path);
+        if (content.find(oldHash) != std::string::npos) {
+            auto newContent = rewriteStrings(content, StringMap{{std::string(oldHash), std::string(newHash)}});
+            chmod(path, (st.st_mode & ~S_IFMT) | S_IWUSR);
+            writeFile(path, newContent, st.st_mode & 07777);
+            chmod(path, st.st_mode & 07777);
+        }
+    } else if (S_ISDIR(st.st_mode)) {
+        chmod(path, (st.st_mode & ~S_IFMT) | S_IWUSR);
+        std::vector<std::filesystem::path> children;
+        for (auto & entry : DirectoryIterator{path})
+            children.push_back(entry.path());
+        for (auto & child : children)
+            rewritePathInPlace(child, oldHash, newHash);
+    }
+}
+
 SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
 {
     std::map<std::string, ValidPathInfo> infos;
@@ -274,6 +413,7 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
         topoSortResult);
 
     OutputPathMap finalOutputs;
+    std::vector<PathLocks> dynamicOutputLocks;
 
     for (auto & outputName : sortedOutputNames | std::views::reverse) {
         auto output = get(drv.outputs, outputName);
@@ -462,23 +602,97 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
             overloaded{
 
                 [&](const DerivationOutput::InputAddressed & output) {
-                    /* input-addressed case */
-                    auto requiredFinalPath = output.path;
-                    /* Preemptively add rewrite rule for final hash, as that is
-                       what the NAR hash will use rather than normalized-self references */
-                    if (*scratchPath != requiredFinalPath)
-                        outputRewrites.insert_or_assign(
-                            std::string{scratchPath->hashPart()}, std::string{requiredFinalPath.hashPart()});
-                    rewriteOutput(outputRewrites);
+                    /* CASPER: Content-Addressable Store via Partial-blinding and Embedded Relocation */
+                    std::optional<std::pair<uid_t, gid_t>> builderOwner;
+#ifndef _WIN32
+                    if (buildUser)
+                        builderOwner = std::make_pair(buildUser->getUID(), buildUser->getGID());
+#endif
+                    auto rootSt = lstat(actualPath);
+                    bool hasCustomRelocate = false;
+                    if (S_ISDIR(rootSt.st_mode)) {
+                        chmod(actualPath, (rootSt.st_mode & ~S_IFMT) | S_IWUSR);
+                        auto nixSupportDir = actualPath / "nix-support";
+                        auto optSupportSt = maybeLstat(nixSupportDir);
+                        if (!optSupportSt || S_ISDIR(optSupportSt->st_mode)) {
+                            createDirs(nixSupportDir);
+                            chmod(nixSupportDir, 0755);
+                            auto relocateScript = nixSupportDir / "relocate.sh";
+                            if (pathExists(relocateScript)) {
+                                hasCustomRelocate = true;
+                            } else {
+                                writeFile(relocateScript, defaultRelocateScript, 0755);
+                                chmod(relocateScript, 0755);
+                            }
+                            auto hashScript = nixSupportDir / "hash.sh";
+                            if (!pathExists(hashScript)) {
+                                writeFile(hashScript, defaultHashScript, 0755);
+                                chmod(hashScript, 0755);
+                            }
+                        }
+                    }
+
+                    bool needRelocateScript = hasCustomRelocate || hasGzFiles(actualPath);
+
+                    /* Rewrite any earlier outputs of this derivation first */
+                    for (auto & [oldDepHash, newDepHash] : outputRewrites) {
+                        if (needRelocateScript) {
+                            preparePathForRelocation(actualPath, builderOwner);
+                            runRelocateScript(*scratchPath, oldDepHash, newDepHash);
+                        }
+                        rewritePathInPlace(actualPath, oldDepHash, newDepHash);
+                    }
+
+                    /* Step 1: Blind self-references from <scratchHash>-<name> to xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-<name> */
+                    std::string outBaseName{output.path.name()};
+                    std::string oldSelf{scratchPath->to_string()};
+                    std::string blindSelf = std::string(StorePath::HashLen, 'x') + "-" + outBaseName;
+                    if (needRelocateScript) {
+                        preparePathForRelocation(actualPath, builderOwner);
+                        runRelocateScript(*scratchPath, oldSelf, blindSelf);
+                    }
+                    rewritePathInPlace(actualPath, oldSelf, blindSelf);
+
+                    /* Step 2: Hash the blinded output and compute content-addressed store path */
+                    HashResult normalizedNar = hashPath(
+                        {makeFSSourceAccessor(actualPath), CanonPath::root},
+                        FileSerialisationMethod::NixArchive,
+                        HashAlgorithm::SHA256);
+                    StorePath caOutPath = store->makeContentAddressedOutputPath(
+                        normalizedNar.hash, outBaseName);
+                    std::string newSelf{caOutPath.to_string()};
+
+                    /* Step 3: Relocate self-references from xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-<name> to <outHash>-<name> */
+                    if (needRelocateScript) {
+                        preparePathForRelocation(actualPath, builderOwner);
+                        runRelocateScript(*scratchPath, blindSelf, newSelf);
+                    }
+                    rewritePathInPlace(actualPath, blindSelf, newSelf);
+
+                    /* Step 4: Canonicalize metadata and compute final NAR hash */
+                    canonicalisePathMetaData(
+                        actualPath,
+                        {
+#ifndef _WIN32
+                            .uidRange = std::nullopt,
+#endif
+                            NIX_WHEN_SUPPORT_ACLS(localSettings.ignoredAcls)},
+                        inodesSeen);
+
                     HashResult narHashAndSize = hashPath(
                         {makeFSSourceAccessor(actualPath), CanonPath::root},
                         FileSerialisationMethod::NixArchive,
                         HashAlgorithm::SHA256);
-                    ValidPathInfo newInfo0{requiredFinalPath, {*store, narHashAndSize.hash}};
+                    ValidPathInfo newInfo0{caOutPath, {*store, narHashAndSize.hash}};
                     newInfo0.narSize = narHashAndSize.numBytesDigested;
+
+                    bool discardReferences = false;
+                    if (auto udr = get(drvOptions.unsafeDiscardReferences, outputName))
+                        discardReferences = *udr;
+
                     auto refs = rewriteRefs();
                     newInfo0.references = std::move(refs.others);
-                    if (refs.self)
+                    if (!discardReferences && (refs.self || narHashAndSize.hash != normalizedNar.hash))
                         newInfo0.references.insert(newInfo0.path);
                     return newInfo0;
                 },
@@ -531,18 +745,20 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
         auto finalDestPath = store->printStorePath(newInfo.path);
 
         /* Lock final output path, if not already locked. This happens with
-           floating CA derivations and hash-mismatching fixed-output
-           derivations. */
-        PathLocks dynamicOutputLock;
+           floating CA derivations, CASPER-relocated input-addressed derivations,
+           and hash-mismatching fixed-output derivations. */
+        auto & dynamicOutputLock = dynamicOutputLocks.emplace_back();
         dynamicOutputLock.setDeletion(true);
         auto optFixedPath = output->path(*store, drv.name, outputName);
         if (!optFixedPath || store->printStorePath(*optFixedPath) != finalDestPath) {
-            assert(newInfo.ca);
+            bool isInputAddressed = std::holds_alternative<DerivationOutput::InputAddressed>(output->raw);
+            bool isCAFixed = std::holds_alternative<DerivationOutput::CAFixed>(output->raw);
+            assert(newInfo.ca || isInputAddressed);
 
             /* Don't wait on lock for the hash-mismatching fixed-output
                derivation case, to avoid a deadlock in the case where a build
                with the correct hash is in progress. */
-            bool locked = dynamicOutputLock.lockPaths({store->toRealPath(newInfo.path)}, "", !optFixedPath);
+            bool locked = dynamicOutputLock.lockPaths({store->toRealPath(newInfo.path)}, "", !isCAFixed);
 
             /* If we can't lock the correct path, clean up and bail now. */
             if (!locked) {
@@ -568,7 +784,7 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
             } else if (localStore.isValidPath(newInfo.path)) {
                 /* Path already exists because CA path produced by something
                    else. No moving needed. */
-                assert(newInfo.ca);
+                assert(newInfo.ca || std::holds_alternative<DerivationOutput::InputAddressed>(output->raw));
                 /* Can delete our scratch copy now. */
                 deletePath(actualPath);
             } else {
@@ -580,13 +796,17 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
 
         if (buildMode == bmCheck) {
             /* Check against already registered outputs */
+            StorePath oldPath = newInfo.path;
+            if (auto * ia = std::get_if<DerivationOutput::InputAddressed>(&output->raw)) {
+                oldPath = localStore.resolveInputPath(ia->path);
+            }
 
-            if (localStore.isValidPath(newInfo.path)) {
-                ValidPathInfo oldInfo(*localStore.queryPathInfo(newInfo.path));
-                if (newInfo.narHash != oldInfo.narHash) {
+            if (localStore.isValidPath(oldPath)) {
+                ValidPathInfo oldInfo(*localStore.queryPathInfo(oldPath));
+                if (newInfo.path != oldInfo.path || newInfo.narHash != oldInfo.narHash) {
                     auto * diffHook = localSettings.getDiffHook();
                     if (diffHook || settings.keepFailed) {
-                        auto dst = store->toRealPath(newInfo.path);
+                        auto dst = store->toRealPath(oldInfo.path);
                         dst += ".check";
                         deletePath(dst);
                         movePath(actualPath, dst);
@@ -598,7 +818,7 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                                 buildUser ? buildUser->getUID() : getuid(),
                                 buildUser ? buildUser->getGID() : getgid(),
 #endif
-                                finalDestPath,
+                                store->printStorePath(oldInfo.path),
                                 dst,
                                 store->printStorePath(drvPath),
                                 tmpDir);
@@ -607,13 +827,13 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                         throw NotDeterministic(
                             "derivation '%s' may not be deterministic: output %s differs from %s",
                             store->printStorePath(drvPath),
-                            PathFmt(store->toRealPath(newInfo.path)),
+                            PathFmt(store->toRealPath(oldInfo.path)),
                             PathFmt(dst));
                     } else
                         throw NotDeterministic(
                             "derivation '%s' may not be deterministic: output %s differs",
                             store->printStorePath(drvPath),
-                            PathFmt(store->toRealPath(newInfo.path)));
+                            PathFmt(store->toRealPath(oldInfo.path)));
                 }
 
                 /* Since we verified the build, it's now ultimately trusted. */
@@ -681,6 +901,13 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
             infos2.insert_or_assign(newInfo.path, newInfo);
         }
         localStore.registerValidPaths(infos2);
+        for (auto & [outputName, newInfo] : infos) {
+            if (auto output = get(drv.outputs, outputName)) {
+                if (auto * ia = std::get_if<DerivationOutput::InputAddressed>(&output->raw)) {
+                    localStore.addPathRewrite(ia->path, newInfo.path, drvPath, outputName);
+                }
+            }
+        }
     }
 
     /* If we made it this far, we are sure the output matches the

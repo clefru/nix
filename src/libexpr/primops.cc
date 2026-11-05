@@ -93,13 +93,16 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
                     ensureValid(b.drvPath->getBaseStorePath());
                 },
                 [&](const NixStringContextElem::Opaque & o) {
+                    auto resolved = buildStore->resolveInputPath(store->resolveInputPath(o.path));
+                    if (resolved != o.path)
+                        res.insert_or_assign(std::string(o.path.hashPart()), std::string(resolved.hashPart()));
                     /* If the path happens to be mounted on the storeFS, that means it's lazy path string and would get
                        copied to the store on-demand (when referenced in a derivation). The string is equal to final
                        store path where the store object would end up (the path is hashed before mounting). */
-                    if (!storeFS->getMount(CanonPath(store->printStorePath(o.path))))
-                        ensureValid(o.path);
+                    if (!storeFS->getMount(CanonPath(store->printStorePath(resolved))))
+                        ensureValid(resolved);
                     if (maybePathsOut)
-                        maybePathsOut->emplace(o.path);
+                        maybePathsOut->emplace(resolved);
                 },
                 [&](const NixStringContextElem::DrvDeep & d) {
                     /* Treat same as Opaque */
@@ -112,7 +115,7 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
     }
 
     if (drvs.empty())
-        return {};
+        return res;
 
     if (isIFD) {
         if (!settings.enableImportFromDerivation)
@@ -136,10 +139,28 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
 
     for (auto & drv : drvs) {
         auto outputs = resolveDerivedPath(*buildStore, drv, &*store);
+        auto depDrvPath = drv.drvPath->getBaseStorePath();
+        std::optional<Derivation> parsedDrv;
+        for (auto * s : {&*store, &*buildStore}) {
+            if (s->isValidPath(depDrvPath)) {
+                parsedDrv = s->readInvalidDerivation(depDrvPath);
+                break;
+            }
+        }
         for (auto & [outputName, outputPath] : outputs) {
             outputsToCopyAndAllow.insert(outputPath);
             if (maybePathsOut)
                 maybePathsOut->emplace(outputPath);
+
+            if (parsedDrv) {
+                if (auto outSpec = get(parsedDrv->outputs, outputName)) {
+                    if (auto origPath = outSpec->path(*store, parsedDrv->name, outputName)) {
+                        if (*origPath != outputPath)
+                            res.insert_or_assign(
+                                std::string(origPath->hashPart()), std::string(outputPath.hashPart()));
+                    }
+                }
+            }
 
             /* Get all the output paths corresponding to the placeholders we had */
             if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations)) {

@@ -58,9 +58,16 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
 
     BuilderExit unprepareBuild() override;
 
+    void cleanupBuild(bool force) override;
+
     void killSandbox(bool getStats) override;
 
     void addDependencyImpl(const StorePath & path) override;
+
+    void runRelocateScript(
+        const StorePath & scratchPath,
+        std::string_view oldHash,
+        std::string_view newHash) override;
 };
 
 } // namespace nix

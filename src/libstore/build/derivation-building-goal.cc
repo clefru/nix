@@ -1357,8 +1357,12 @@ std::map<std::string, std::optional<StorePath>> DerivationBuildingGoal::queryPar
     /* In-memory derivation will naturally fall back on this case, where
        we do best-effort with static information. */
     std::map<std::string, std::optional<StorePath>> res;
-    for (auto & [name, output] : drv->outputs)
-        res.insert_or_assign(name, output.path(worker.store, drv->name, name));
+    for (auto & [name, output] : drv->outputs) {
+        auto optP = output.path(worker.store, drv->name, name);
+        if (optP)
+            optP = worker.store.resolveInputPath(*optP);
+        res.insert_or_assign(name, optP);
+    }
     return res;
 }
 
