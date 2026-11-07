@@ -1098,6 +1098,13 @@ void ChrootLinuxDerivationBuilder::runRelocateScript(
             if (!hasPath && !extraPath.empty())
                 envStrs.push_back("PATH=" + extraPath);
 
+            Strings directArgs{
+                scriptInSandbox,
+                std::string(oldSelf),
+                std::string(newSelf),
+            };
+            execve(scriptInSandbox.c_str(), stringsToCharPtrs(directArgs).data(), stringsToCharPtrs(envStrs).data());
+
             std::string shell = "/bin/sh";
             if (!pathExists(shell) && !drv.isBuiltin()
                 && (hasSuffix(drv.builder, "/sh") || hasSuffix(drv.builder, "/bash")

@@ -6,7 +6,6 @@
 #include "nix/store/posix-fs-canonicalise.hh"
 #include "nix/store/restricted-store.hh"
 #include "nix/util/archive.hh"
-#include "nix/util/compression.hh"
 #include "nix/util/file-content-address.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/git.hh"
@@ -108,8 +107,7 @@ static void replaceValidPath(const std::filesystem::path & storePath, const std:
 static void relocateNAR(
     Source & source,
     Sink & sink,
-    const StringMap & rewrites,
-    Sink * extraRefScanSink = nullptr)
+    const StringMap & rewrites)
 {
     StringMap activeRewrites;
     for (auto & [k, v] : rewrites) {
@@ -117,7 +115,7 @@ static void relocateNAR(
             activeRewrites.insert_or_assign(k, v);
     }
 
-    if (activeRewrites.empty() && !extraRefScanSink) {
+    if (activeRewrites.empty()) {
         copyNAR(source, sink);
         return;
     }
@@ -142,7 +140,7 @@ static void relocateNAR(
         throw SerialisationError("bad archive: input doesn't look like a Nix archive");
     sink << narVersionMagic1;
 
-    [&](this const auto & processNode, Sink & outSink, std::string_view entryName, size_t depth) -> void {
+    [&](this const auto & processNode, Sink & outSink, size_t depth) -> void {
         if (depth >= narMaxDepth)
             throw SerialisationError("bad archive: NAR directory nesting exceeds maximum depth of %d", narMaxDepth);
 
@@ -168,52 +166,14 @@ static void relocateNAR(
             outSink << "(" << "type" << "regular";
             if (executable)
                 outSink << "executable" << "";
-
-            if (hasSuffix(entryName, ".gz") && size > 0) {
-                std::string compressed(size, '\0');
-                source(compressed.data(), size);
-                readPadding(size, source);
-
-                bool rewrittenGz = false;
-                std::string finalGz;
-                try {
-                    std::string decompressed = decompress(CompressionAlgo::gzip, compressed);
-                    if (extraRefScanSink)
-                        (*extraRefScanSink)(decompressed);
-                    bool anyMatch = false;
-                    for (auto & [oldStr, _] : activeRewrites) {
-                        if (decompressed.find(oldStr) != std::string::npos) {
-                            anyMatch = true;
-                            break;
-                        }
-                    }
-                    if (anyMatch) {
-                        std::string rewritten = rewriteStrings(decompressed, activeRewrites);
-                        if (extraRefScanSink)
-                            (*extraRefScanSink)(rewritten);
-                        finalGz = compress(CompressionAlgo::gzip, rewritten);
-                        rewrittenGz = true;
-                    }
-                } catch (...) {
-                    /* Not a valid gzip stream or failed to decompress; preserve raw bytes */
-                }
-
-                if (rewrittenGz)
-                    outSink << "contents" << finalGz;
-                else
-                    outSink << "contents" << compressed;
-            } else {
-                outSink << "contents" << size;
-                if (!activeRewrites.empty() && size > 0) {
-                    RewritingSink rsink(activeRewrites, outSink);
-                    source.drainInto(rsink, size);
-                    rsink.flush();
-                } else if (size > 0) {
-                    source.drainInto(outSink, size);
-                }
-                readPadding(size, source);
-                writePadding(size, outSink);
+            outSink << "contents" << size;
+            if (size > 0) {
+                RewritingSink rsink(activeRewrites, outSink);
+                source.drainInto(rsink, size);
+                rsink.flush();
             }
+            readPadding(size, source);
+            writePadding(size, outSink);
 
             expectTag(")");
             outSink << ")";
@@ -240,10 +200,10 @@ static void relocateNAR(
                 auto name = getString(narMaxName);
                 expectTag("node");
 
-                std::string newName = activeRewrites.empty() ? name : rewriteStrings(name, activeRewrites);
+                std::string newName = rewriteStrings(name, activeRewrites);
                 if (newName != name) {
                     StringSink nodeSink;
-                    processNode(nodeSink, newName, depth + 1);
+                    processNode(nodeSink, depth + 1);
                     expectTag(")");
                     deferredEntries.insert_or_assign(newName, std::move(nodeSink.s));
                 } else {
@@ -255,7 +215,7 @@ static void relocateNAR(
                         outSink << ")";
                     }
                     outSink << "entry" << "(" << "name" << name << "node";
-                    processNode(outSink, name, depth + 1);
+                    processNode(outSink, depth + 1);
                     expectTag(")");
                     outSink << ")";
                 }
@@ -264,12 +224,12 @@ static void relocateNAR(
             expectTag("target");
             auto target = getString(narMaxTarget);
             expectTag(")");
-            std::string newTarget = activeRewrites.empty() ? target : rewriteStrings(target, activeRewrites);
+            std::string newTarget = rewriteStrings(target, activeRewrites);
             outSink << "(" << "type" << "symlink" << "target" << newTarget << ")";
         } else {
             throw SerialisationError("bad archive: unknown file type '%s'", type);
         }
-    }(sink, "", 0);
+    }(sink, 0);
 }
 
 SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
@@ -393,21 +353,14 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
         else if (isInputAddressed) {
             /* For InputAddressed outputs, full reference scanning happens on the
                final relocated NAR stream in Pass 2. Only scan for sibling outputs
-               here when drv.outputs.size() > 1 so topoSort orders outputs correctly
-               (including references inside compressed .gz files). */
+               here when drv.outputs.size() > 1 so topoSort orders outputs correctly. */
             if (drv.outputs.size() > 1) {
                 StorePathSet siblingPaths;
                 for (auto & [sibName, sibPath] : scratchOutputs)
                     if (sibName != outputName)
                         siblingPaths.insert(sibPath);
-                PathRefScanSink sibScan = PathRefScanSink::fromPaths(siblingPaths);
                 NullSink blank;
-                TeeSink scanTee(blank, sibScan);
-                auto dumpSource = sinkToSource([&](Sink & dumpSink) {
-                    dumpPath(actualPath, dumpSink);
-                });
-                relocateNAR(*dumpSource, scanTee, {}, &sibScan);
-                references = sibScan.getResultPaths();
+                references = scanForReferences(blank, actualPath, siblingPaths);
             }
         } else {
             debug("scanning for references for output '%s' in temp location %s", outputName, PathFmt(actualPath));
@@ -429,6 +382,30 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                 .otherOutputs = referencedOutputs,
             });
         outputStats.insert_or_assign(outputName, std::move(st));
+    }
+
+    /* Ensure documentation/debug outputs are relocated after primary outputs
+       ("lib", "out", "bin") even when their sibling references are compressed
+       and only decoded by a custom relocate.sh hook. */
+    if (drv.outputs.size() > 1) {
+        static const StringSet docOutputs{"man", "doc", "info", "devdoc", "debug"};
+        static const StringSet primaryOutputs{"lib", "out", "bin"};
+        for (auto & [outName, orifu] : outputReferencesIfUnregistered) {
+            if (!docOutputs.contains(outName))
+                continue;
+            auto * pntr = std::get_if<PerhapsNeedToRegister>(&orifu);
+            if (!pntr)
+                continue;
+            for (auto & primName : primaryOutputs) {
+                auto * primOrifu = get(outputReferencesIfUnregistered, primName);
+                if (!primOrifu)
+                    continue;
+                if (auto * primPntr = std::get_if<PerhapsNeedToRegister>(primOrifu))
+                    if (primPntr->otherOutputs.contains(outName))
+                        continue;
+                pntr->otherOutputs.insert(primName);
+            }
+        }
     }
 
     StringSet emptySet;
@@ -745,8 +722,7 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                             relocateNAR(
                                 blindedSource,
                                 tee2,
-                                StringMap{{blindSelf, newSelf}},
-                                discardReferences ? nullptr : &postRelocRefScan);
+                                StringMap{{blindSelf, newSelf}});
                         }
                     });
                     restorePath(tmpOutput, *relocatedSource, store->getLocalSettings().fsyncStorePaths);

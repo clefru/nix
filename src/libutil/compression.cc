@@ -127,8 +127,6 @@ struct ArchiveCompressionSink : CompressionSink
 
         check(addFilter(archive), "couldn't initialize compression (%s)");
         check(archive_write_set_format_raw(archive));
-        if (method == CompressionAlgo::gzip)
-            check(archive_write_set_filter_option(archive, format, "timestamp", nullptr));
         if (parallel)
             check(archive_write_set_filter_option(archive, format, "threads", "0"));
         if (level != COMPRESSION_LEVEL_DEFAULT)

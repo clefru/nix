@@ -1049,6 +1049,13 @@ void UnixDerivationBuilderImpl::runRelocateScript(
             if (!hasPath && !extraPath.empty())
                 envStrs.push_back("PATH=" + extraPath);
 
+            Strings directArgs{
+                scriptPath.native(),
+                std::string(oldSelf),
+                std::string(newSelf),
+            };
+            execve(scriptPath.c_str(), stringsToCharPtrs(directArgs).data(), stringsToCharPtrs(envStrs).data());
+
             std::string shell = "/bin/sh";
             if (!pathExists(shell) && !drv.isBuiltin()
                 && (hasSuffix(drv.builder, "/sh") || hasSuffix(drv.builder, "/bash")
