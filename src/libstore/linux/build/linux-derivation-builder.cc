@@ -14,6 +14,7 @@
 #include "nix/util/os-filename.hh"
 #include "nix/util/logging.hh"
 #include "nix/util/serialise.hh"
+#include "nix/util/archive.hh"
 #include "linux/fchmodat2-compat.hh"
 
 #include <algorithm>
@@ -21,6 +22,7 @@
 #include <cassert>
 #include <cstdint>
 #include <atomic>
+#include <thread>
 
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -1014,32 +1016,65 @@ void ChrootLinuxDerivationBuilder::addDependencyImpl(const StorePath & path)
 
 void ChrootLinuxDerivationBuilder::runRelocateScript(
     const StorePath & scratchPath,
-    std::string_view oldHash,
-    std::string_view newHash)
+    std::string_view oldSelf,
+    std::string_view newSelf,
+    Source & narIn,
+    Sink & narOut)
 {
-    if (oldHash.empty() || oldHash == newHash)
+    if (oldSelf.empty() || oldSelf == newSelf) {
+        copyNAR(narIn, narOut);
         return;
+    }
 
     if (sandboxMountNamespace.get() == -1) {
-        UnixDerivationBuilderImpl::runRelocateScript(scratchPath, oldHash, newHash);
+        UnixDerivationBuilderImpl::runRelocateScript(scratchPath, oldSelf, newSelf, narIn, narOut);
         return;
     }
 
     auto hostScriptPath = realPathInHost(scratchPath) / "nix-support" / "relocate.sh";
-    if (!pathExists(hostScriptPath))
+    if (!pathExists(hostScriptPath)) {
+        copyNAR(narIn, narOut);
         return;
+    }
+
+    Pipe inPipe, outPipe, errPipe;
+    inPipe.create();
+    outPipe.create();
+    errPipe.create();
 
     Pid child(startProcess([&]() {
         try {
+            inPipe.writeSide.close();
+            outPipe.readSide.close();
+            errPipe.readSide.close();
+
+            if (dup2(inPipe.readSide.get(), STDIN_FILENO) == -1)
+                _exit(1);
+            if (dup2(outPipe.writeSide.get(), STDOUT_FILENO) == -1)
+                _exit(1);
+            if (dup2(errPipe.writeSide.get(), STDERR_FILENO) == -1)
+                _exit(1);
+
+            inPipe.readSide.close();
+            outPipe.writeSide.close();
+            errPipe.writeSide.close();
+
+            if (!buildUser)
+                setgroups(0, 0);
             if (usingUserNamespace && (setns(sandboxUserNamespace.get(), CLONE_NEWUSER) == -1))
                 _exit(1);
             if (setns(sandboxMountNamespace.get(), CLONE_NEWNS) == -1)
                 _exit(1);
+            if (derivationType.isSandboxed()) {
+                unshare(CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWNS);
+            }
             if (chdir(chrootRootDir.c_str()) == -1)
                 _exit(1);
             if (chroot(".") == -1)
                 _exit(1);
 
+            unix::closeExtraFDs();
+            LinuxDerivationBuilder::enterChroot();
             setUser();
 
             auto targetDir = store->printStorePath(scratchPath);
@@ -1074,9 +1109,8 @@ void ChrootLinuxDerivationBuilder::runRelocateScript(
             Strings args{
                 "sh",
                 scriptInSandbox,
-                targetDir,
-                std::string(oldHash),
-                std::string(newHash),
+                std::string(oldSelf),
+                std::string(newSelf),
             };
             execve(shell.c_str(), stringsToCharPtrs(args).data(), stringsToCharPtrs(envStrs).data());
         } catch (...) {
@@ -1084,7 +1118,62 @@ void ChrootLinuxDerivationBuilder::runRelocateScript(
         _exit(1);
     }));
 
-    child.wait();
+    inPipe.readSide.close();
+    outPipe.writeSide.close();
+    errPipe.writeSide.close();
+
+    std::exception_ptr writerException;
+    std::thread writerThread([&]() {
+        try {
+            FdSink inSink(inPipe.writeSide.get());
+            narIn.drainInto(inSink);
+            inSink.flush();
+        } catch (SysError & e) {
+            if (e.errNo != EPIPE)
+                writerException = std::current_exception();
+        } catch (...) {
+            writerException = std::current_exception();
+        }
+        inPipe.writeSide.close();
+    });
+
+    std::string errOutput;
+    std::thread errThread([&]() {
+        try {
+            errOutput = drainFD(errPipe.readSide.get());
+        } catch (...) {
+        }
+        errPipe.readSide.close();
+    });
+
+    std::exception_ptr readerException;
+    try {
+        FdSource outSource(outPipe.readSide.get());
+        copyNAR(outSource, narOut);
+    } catch (...) {
+        readerException = std::current_exception();
+    }
+    outPipe.readSide.close();
+
+    writerThread.join();
+    errThread.join();
+
+    int status = child.wait();
+    killSandbox(false);
+
+    if (!statusOk(status)) {
+        throw BuildError(
+            BuildResult::Failure::OutputRejected,
+            "relocate.sh for '%s' failed (%s)%s%s",
+            store->printStorePath(scratchPath),
+            statusToString(status),
+            errOutput.empty() ? "" : ": ",
+            trim(errOutput));
+    }
+    if (writerException)
+        std::rethrow_exception(writerException);
+    if (readerException)
+        std::rethrow_exception(readerException);
 }
 
 } // namespace nix

@@ -256,8 +256,10 @@ protected:
 
     void runRelocateScript(
         const StorePath & scratchPath,
-        std::string_view oldHash,
-        std::string_view newHash) override;
+        std::string_view oldSelf,
+        std::string_view newSelf,
+        Source & narIn,
+        Sink & narOut) override;
 
     /**
      * Make a file owned by the builder.

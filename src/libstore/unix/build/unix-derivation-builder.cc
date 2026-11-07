@@ -1,4 +1,5 @@
 #include "nix/store/build/derivation-builder.hh"
+#include "nix/util/archive.hh"
 #include "nix/util/configuration.hh"
 #include "nix/util/file-system-at.hh"
 #include "nix/util/os-filename.hh"
@@ -38,6 +39,7 @@
 #include <iostream>
 #include <list>
 #include <atomic>
+#include <thread>
 
 #include "nix/util/strings.hh"
 #include "nix/util/signals.hh"
@@ -987,19 +989,46 @@ void UnixDerivationBuilderImpl::execBuilder(const Strings & args, const Strings 
 
 void UnixDerivationBuilderImpl::runRelocateScript(
     const StorePath & scratchPath,
-    std::string_view oldHash,
-    std::string_view newHash)
+    std::string_view oldSelf,
+    std::string_view newSelf,
+    Source & narIn,
+    Sink & narOut)
 {
-    if (oldHash.empty() || oldHash == newHash)
+    if (oldSelf.empty() || oldSelf == newSelf) {
+        copyNAR(narIn, narOut);
         return;
+    }
 
     auto targetDir = realPathInHost(scratchPath);
     auto scriptPath = targetDir / "nix-support" / "relocate.sh";
-    if (!pathExists(scriptPath))
+    if (!pathExists(scriptPath)) {
+        copyNAR(narIn, narOut);
         return;
+    }
+
+    Pipe inPipe, outPipe, errPipe;
+    inPipe.create();
+    outPipe.create();
+    errPipe.create();
 
     Pid child(startProcess([&]() {
         try {
+            inPipe.writeSide.close();
+            outPipe.readSide.close();
+            errPipe.readSide.close();
+
+            if (dup2(inPipe.readSide.get(), STDIN_FILENO) == -1)
+                _exit(1);
+            if (dup2(outPipe.writeSide.get(), STDOUT_FILENO) == -1)
+                _exit(1);
+            if (dup2(errPipe.writeSide.get(), STDERR_FILENO) == -1)
+                _exit(1);
+
+            inPipe.readSide.close();
+            outPipe.writeSide.close();
+            errPipe.writeSide.close();
+
+            unix::closeExtraFDs();
             setUser();
 
             Strings envStrs;
@@ -1031,9 +1060,8 @@ void UnixDerivationBuilderImpl::runRelocateScript(
             Strings args{
                 "sh",
                 scriptPath.native(),
-                targetDir.native(),
-                std::string(oldHash),
-                std::string(newHash),
+                std::string(oldSelf),
+                std::string(newSelf),
             };
             execve(shell.c_str(), stringsToCharPtrs(args).data(), stringsToCharPtrs(envStrs).data());
         } catch (...) {
@@ -1041,7 +1069,62 @@ void UnixDerivationBuilderImpl::runRelocateScript(
         _exit(1);
     }));
 
-    child.wait();
+    inPipe.readSide.close();
+    outPipe.writeSide.close();
+    errPipe.writeSide.close();
+
+    std::exception_ptr writerException;
+    std::thread writerThread([&]() {
+        try {
+            FdSink inSink(inPipe.writeSide.get());
+            narIn.drainInto(inSink);
+            inSink.flush();
+        } catch (SysError & e) {
+            if (e.errNo != EPIPE)
+                writerException = std::current_exception();
+        } catch (...) {
+            writerException = std::current_exception();
+        }
+        inPipe.writeSide.close();
+    });
+
+    std::string errOutput;
+    std::thread errThread([&]() {
+        try {
+            errOutput = drainFD(errPipe.readSide.get());
+        } catch (...) {
+        }
+        errPipe.readSide.close();
+    });
+
+    std::exception_ptr readerException;
+    try {
+        FdSource outSource(outPipe.readSide.get());
+        copyNAR(outSource, narOut);
+    } catch (...) {
+        readerException = std::current_exception();
+    }
+    outPipe.readSide.close();
+
+    writerThread.join();
+    errThread.join();
+
+    int status = child.wait();
+    killSandbox(false);
+
+    if (!statusOk(status)) {
+        throw BuildError(
+            BuildResult::Failure::OutputRejected,
+            "relocate.sh for '%s' failed (%s)%s%s",
+            store->printStorePath(scratchPath),
+            statusToString(status),
+            errOutput.empty() ? "" : ": ",
+            trim(errOutput));
+    }
+    if (writerException)
+        std::rethrow_exception(writerException);
+    if (readerException)
+        std::rethrow_exception(readerException);
 }
 
 void UnixDerivationBuilderImpl::cleanupBuild(bool force)

@@ -6,10 +6,12 @@
 #include "nix/store/posix-fs-canonicalise.hh"
 #include "nix/store/restricted-store.hh"
 #include "nix/util/archive.hh"
+#include "nix/util/compression.hh"
 #include "nix/util/file-content-address.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/git.hh"
 #include "nix/util/processes.hh"
+#include "nix/util/signals.hh"
 #include "nix/util/source-accessor.hh"
 #include "nix/util/topo-sort.hh"
 
@@ -103,143 +105,171 @@ static void replaceValidPath(const std::filesystem::path & storePath, const std:
         deletePath(oldPath);
 }
 
-static constexpr std::string_view defaultRelocateScript = R"sh(#!/bin/sh
-export LC_ALL=C
-target="$1"
-old="$2"
-new="$3"
-if [ -z "$target" ] || [ -z "$old" ] || [ -z "$new" ] || [ "$old" = "$new" ]; then
-    exit 0
-fi
-
-# 1. Decompress, rewrite, and deterministically recompress gzip files containing old hash
-find "$target" -type f -name '*.gz' 2>/dev/null | while IFS= read -r f; do
-    if gzip -dc "$f" 2>/dev/null | grep -q "$old" 2>/dev/null; then
-        chmod u+w "$(dirname "$f")" "$f" 2>/dev/null || true
-        if gzip -dc "$f" 2>/dev/null | sed "s|$old|$new|g" | gzip -n > "$f.tmp"; then
-            cat "$f.tmp" > "$f"
-        fi
-        rm -f "$f.tmp"
-    fi
-done
-
-# 2. Rewrite regular files containing old hash in-place (preserving permissions)
-find "$target" -type f ! -name '*.gz' -exec grep -l "$old" {} + 2>/dev/null | while IFS= read -r f; do
-    chmod u+w "$(dirname "$f")" "$f" 2>/dev/null || true
-    if sed "s|$old|$new|g" "$f" > "$f.tmp" 2>/dev/null; then
-        cat "$f.tmp" > "$f"
-    fi
-    rm -f "$f.tmp"
-done
-
-# 3. Rewrite symlinks whose target contains old hash
-find "$target" -type l 2>/dev/null | while IFS= read -r l; do
-    lnk=$(readlink "$l" 2>/dev/null) || continue
-    case "$lnk" in
-        *"$old"*)
-            newlnk=$(printf '%s\n' "$lnk" | sed "s|$old|$new|g")
-            chmod u+w "$(dirname "$l")" 2>/dev/null || true
-            ln -snf "$newlnk" "$l" 2>/dev/null || true
-            ;;
-    esac
-done
-)sh";
-
-static constexpr std::string_view defaultHashScript = R"sh(#!/bin/sh
-export LC_ALL=C
-set -e
-if [ "$1" = "--blind-in-place" ]; then
-    target="$2"
-    old_self="$3"
-    blind_self="$4"
-    exec "$target/nix-support/relocate.sh" "$target" "$old_self" "$blind_self"
-fi
-
-target="${1:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}"
-base="${2:-$(basename -- "$target")}"
-name="${base#????????????????????????????????-}"
-blind="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-$name"
-
-tmpdir=$(mktemp -d)
-trap 'chmod -R u+w "$tmpdir" 2>/dev/null || true; rm -rf "$tmpdir"' EXIT
-cp -a "$target" "$tmpdir/$base"
-chmod -R u+w "$tmpdir/$base" 2>/dev/null || true
-"$target/nix-support/relocate.sh" "$tmpdir/$base" "$base" "$blind"
-"${NIX_HASH_BIN:-nix-hash}" --type sha256 --truncate --base32 "$tmpdir/$base"
-)sh";
-
-static void preparePathForRelocation(
-    const std::filesystem::path & path,
-    std::optional<std::pair<uid_t, gid_t>> owner)
+static void relocateNAR(
+    Source & source,
+    Sink & sink,
+    const StringMap & rewrites,
+    Sink * extraRefScanSink = nullptr)
 {
-    auto st = lstat(path);
-#ifndef _WIN32
-    if (owner) {
-        if (lchown(path.c_str(), owner->first, owner->second) == -1)
-            throw SysError("changing owner of %1% for relocation", PathFmt(path));
+    StringMap activeRewrites;
+    for (auto & [k, v] : rewrites) {
+        if (!k.empty() && k != v)
+            activeRewrites.insert_or_assign(k, v);
     }
-#endif
-    if (!S_ISLNK(st.st_mode)) {
-        chmod(path, (st.st_mode & ~S_IFMT) | S_IWUSR);
-    }
-    if (S_ISDIR(st.st_mode)) {
-        for (auto & entry : DirectoryIterator{path})
-            preparePathForRelocation(entry.path(), owner);
-    }
-}
 
-static bool hasGzFiles(const std::filesystem::path & path)
-{
-    auto st = lstat(path);
-    if (S_ISREG(st.st_mode))
-        return path.extension() == ".gz";
-    if (S_ISDIR(st.st_mode)) {
-        for (auto & entry : DirectoryIterator{path})
-            if (hasGzFiles(entry.path()))
-                return true;
-    }
-    return false;
-}
-
-static void rewritePathInPlace(
-    const std::filesystem::path & path,
-    std::string_view oldHash,
-    std::string_view newHash)
-{
-    if (oldHash.empty() || oldHash == newHash)
+    if (activeRewrites.empty() && !extraRefScanSink) {
+        copyNAR(source, sink);
         return;
-
-    auto st = lstat(path);
-    if (S_ISLNK(st.st_mode)) {
-        auto target = readLink(path).native();
-        if (target.find(oldHash) != std::string::npos) {
-            auto newTarget = rewriteStrings(target, StringMap{{std::string(oldHash), std::string(newHash)}});
-            auto parent = path.parent_path();
-            if (!parent.empty()) {
-                auto pst = lstat(parent);
-                chmod(parent, (pst.st_mode & ~S_IFMT) | S_IWUSR);
-            }
-            std::filesystem::remove(path);
-            createSymlink(newTarget, path);
-        }
-    } else if (S_ISREG(st.st_mode)) {
-        if (path.extension() == ".gz")
-            return;
-        auto content = readFile(path);
-        if (content.find(oldHash) != std::string::npos) {
-            auto newContent = rewriteStrings(content, StringMap{{std::string(oldHash), std::string(newHash)}});
-            chmod(path, (st.st_mode & ~S_IFMT) | S_IWUSR);
-            writeFile(path, newContent, st.st_mode & 07777);
-            chmod(path, st.st_mode & 07777);
-        }
-    } else if (S_ISDIR(st.st_mode)) {
-        chmod(path, (st.st_mode & ~S_IFMT) | S_IWUSR);
-        std::vector<std::filesystem::path> children;
-        for (auto & entry : DirectoryIterator{path})
-            children.push_back(entry.path());
-        for (auto & child : children)
-            rewritePathInPlace(child, oldHash, newHash);
     }
+
+    constexpr size_t narMaxTag = 32;
+    constexpr size_t narMaxName = 255;
+    constexpr size_t narMaxTarget = 4095;
+
+    auto getString = [&](size_t max) {
+        checkInterrupt();
+        return readString(source, max);
+    };
+
+    auto expectTag = [&](std::string_view expected) {
+        auto tag = getString(narMaxTag);
+        if (tag != expected)
+            throw SerialisationError("bad archive: expected tag '%s', got '%s'", expected, tag);
+    };
+
+    std::string version = getString(narVersionMagic1.size());
+    if (version != narVersionMagic1)
+        throw SerialisationError("bad archive: input doesn't look like a Nix archive");
+    sink << narVersionMagic1;
+
+    [&](this const auto & processNode, Sink & outSink, std::string_view entryName, size_t depth) -> void {
+        if (depth >= narMaxDepth)
+            throw SerialisationError("bad archive: NAR directory nesting exceeds maximum depth of %d", narMaxDepth);
+
+        expectTag("(");
+        expectTag("type");
+        auto type = getString(narMaxTag);
+
+        if (type == "regular") {
+            auto tag = getString(narMaxTag);
+            bool executable = false;
+            if (tag == "executable") {
+                auto s2 = getString(0);
+                if (!s2.empty())
+                    throw SerialisationError("bad archive: executable marker has non-empty value");
+                executable = true;
+                tag = getString(narMaxTag);
+            }
+            if (tag != "contents")
+                throw SerialisationError("bad archive: expected tag 'contents', got '%s'", tag);
+
+            uint64_t size = readLongLong(source);
+
+            outSink << "(" << "type" << "regular";
+            if (executable)
+                outSink << "executable" << "";
+
+            if (hasSuffix(entryName, ".gz") && size > 0) {
+                std::string compressed(size, '\0');
+                source(compressed.data(), size);
+                readPadding(size, source);
+
+                bool rewrittenGz = false;
+                std::string finalGz;
+                try {
+                    std::string decompressed = decompress(CompressionAlgo::gzip, compressed);
+                    if (extraRefScanSink)
+                        (*extraRefScanSink)(decompressed);
+                    bool anyMatch = false;
+                    for (auto & [oldStr, _] : activeRewrites) {
+                        if (decompressed.find(oldStr) != std::string::npos) {
+                            anyMatch = true;
+                            break;
+                        }
+                    }
+                    if (anyMatch) {
+                        std::string rewritten = rewriteStrings(decompressed, activeRewrites);
+                        if (extraRefScanSink)
+                            (*extraRefScanSink)(rewritten);
+                        finalGz = compress(CompressionAlgo::gzip, rewritten);
+                        rewrittenGz = true;
+                    }
+                } catch (...) {
+                    /* Not a valid gzip stream or failed to decompress; preserve raw bytes */
+                }
+
+                if (rewrittenGz)
+                    outSink << "contents" << finalGz;
+                else
+                    outSink << "contents" << compressed;
+            } else {
+                outSink << "contents" << size;
+                if (!activeRewrites.empty() && size > 0) {
+                    RewritingSink rsink(activeRewrites, outSink);
+                    source.drainInto(rsink, size);
+                    rsink.flush();
+                } else if (size > 0) {
+                    source.drainInto(outSink, size);
+                }
+                readPadding(size, source);
+                writePadding(size, outSink);
+            }
+
+            expectTag(")");
+            outSink << ")";
+        } else if (type == "directory") {
+            outSink << "(" << "type" << "directory";
+            std::map<std::string, std::string> deferredEntries;
+
+            while (true) {
+                auto tag = getString(narMaxTag);
+                if (tag == ")") {
+                    for (auto & [dName, dNode] : deferredEntries) {
+                        outSink << "entry" << "(" << "name" << dName << "node";
+                        outSink(dNode);
+                        outSink << ")";
+                    }
+                    outSink << ")";
+                    break;
+                }
+                if (tag != "entry")
+                    throw SerialisationError("bad archive: expected tag 'entry' or ')', got '%s'", tag);
+
+                expectTag("(");
+                expectTag("name");
+                auto name = getString(narMaxName);
+                expectTag("node");
+
+                std::string newName = activeRewrites.empty() ? name : rewriteStrings(name, activeRewrites);
+                if (newName != name) {
+                    StringSink nodeSink;
+                    processNode(nodeSink, newName, depth + 1);
+                    expectTag(")");
+                    deferredEntries.insert_or_assign(newName, std::move(nodeSink.s));
+                } else {
+                    for (auto it = deferredEntries.begin();
+                         it != deferredEntries.end() && it->first < name;
+                         it = deferredEntries.erase(it)) {
+                        outSink << "entry" << "(" << "name" << it->first << "node";
+                        outSink(it->second);
+                        outSink << ")";
+                    }
+                    outSink << "entry" << "(" << "name" << name << "node";
+                    processNode(outSink, name, depth + 1);
+                    expectTag(")");
+                    outSink << ")";
+                }
+            }
+        } else if (type == "symlink") {
+            expectTag("target");
+            auto target = getString(narMaxTarget);
+            expectTag(")");
+            std::string newTarget = activeRewrites.empty() ? target : rewriteStrings(target, activeRewrites);
+            outSink << "(" << "type" << "symlink" << "target" << newTarget << ")";
+        } else {
+            throw SerialisationError("bad archive: unknown file type '%s'", type);
+        }
+    }(sink, "", 0);
 }
 
 SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
@@ -352,10 +382,34 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
             discardReferences = *udr;
         }
 
+        bool isInputAddressed = [&] {
+            auto outSpec = get(drv.outputs, outputName);
+            return outSpec && std::holds_alternative<DerivationOutput::InputAddressed>(outSpec->raw);
+        }();
+
         StorePathSet references;
         if (discardReferences)
             debug("discarding references of output '%s'", outputName);
-        else {
+        else if (isInputAddressed) {
+            /* For InputAddressed outputs, full reference scanning happens on the
+               final relocated NAR stream in Pass 2. Only scan for sibling outputs
+               here when drv.outputs.size() > 1 so topoSort orders outputs correctly
+               (including references inside compressed .gz files). */
+            if (drv.outputs.size() > 1) {
+                StorePathSet siblingPaths;
+                for (auto & [sibName, sibPath] : scratchOutputs)
+                    if (sibName != outputName)
+                        siblingPaths.insert(sibPath);
+                PathRefScanSink sibScan = PathRefScanSink::fromPaths(siblingPaths);
+                NullSink blank;
+                TeeSink scanTee(blank, sibScan);
+                auto dumpSource = sinkToSource([&](Sink & dumpSink) {
+                    dumpPath(actualPath, dumpSink);
+                });
+                relocateNAR(*dumpSource, scanTee, {}, &sibScan);
+                references = sibScan.getResultPaths();
+            }
+        } else {
             debug("scanning for references for output '%s' in temp location %s", outputName, PathFmt(actualPath));
 
             /* Pass blank Sink as we are not ready to hash data at this stage. */
@@ -602,98 +656,112 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
             overloaded{
 
                 [&](const DerivationOutput::InputAddressed & output) {
-                    /* CASPER: Content-Addressable Store via Partial-blinding and Embedded Relocation */
-                    std::optional<std::pair<uid_t, gid_t>> builderOwner;
-#ifndef _WIN32
-                    if (buildUser)
-                        builderOwner = std::make_pair(buildUser->getUID(), buildUser->getGID());
-#endif
+                    /* CASPER: Pure NAR -> NAR Stream Blinding & Embedded Relocation */
                     auto rootSt = lstat(actualPath);
-                    bool hasCustomRelocate = false;
-                    if (S_ISDIR(rootSt.st_mode)) {
-                        chmod(actualPath, (rootSt.st_mode & ~S_IFMT) | S_IWUSR);
-                        auto nixSupportDir = actualPath / "nix-support";
-                        auto optSupportSt = maybeLstat(nixSupportDir);
-                        if (!optSupportSt || S_ISDIR(optSupportSt->st_mode)) {
-                            createDirs(nixSupportDir);
-                            chmod(nixSupportDir, 0755);
-                            auto relocateScript = nixSupportDir / "relocate.sh";
-                            if (pathExists(relocateScript)) {
-                                hasCustomRelocate = true;
-                            } else {
-                                writeFile(relocateScript, defaultRelocateScript, 0755);
-                                chmod(relocateScript, 0755);
-                            }
-                            auto hashScript = nixSupportDir / "hash.sh";
-                            if (!pathExists(hashScript)) {
-                                writeFile(hashScript, defaultHashScript, 0755);
-                                chmod(hashScript, 0755);
-                            }
-                        }
-                    }
-
-                    bool needRelocateScript = hasCustomRelocate || hasGzFiles(actualPath);
-
-                    /* Rewrite any earlier outputs of this derivation first */
-                    for (auto & [oldDepHash, newDepHash] : outputRewrites) {
-                        if (needRelocateScript) {
-                            preparePathForRelocation(actualPath, builderOwner);
-                            runRelocateScript(*scratchPath, oldDepHash, newDepHash);
-                        }
-                        rewritePathInPlace(actualPath, oldDepHash, newDepHash);
-                    }
-
-                    /* Step 1: Blind self-references from <scratchHash>-<name> to xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-<name> */
-                    std::string outBaseName{output.path.name()};
-                    std::string oldSelf{scratchPath->to_string()};
-                    std::string blindSelf = std::string(StorePath::HashLen, 'x') + "-" + outBaseName;
-                    if (needRelocateScript) {
-                        preparePathForRelocation(actualPath, builderOwner);
-                        runRelocateScript(*scratchPath, oldSelf, blindSelf);
-                    }
-                    rewritePathInPlace(actualPath, oldSelf, blindSelf);
-
-                    /* Step 2: Hash the blinded output and compute content-addressed store path */
-                    HashResult normalizedNar = hashPath(
-                        {makeFSSourceAccessor(actualPath), CanonPath::root},
-                        FileSerialisationMethod::NixArchive,
-                        HashAlgorithm::SHA256);
-                    StorePath caOutPath = store->makeContentAddressedOutputPath(
-                        normalizedNar.hash, outBaseName);
-                    std::string newSelf{caOutPath.to_string()};
-
-                    /* Step 3: Relocate self-references from xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-<name> to <outHash>-<name> */
-                    if (needRelocateScript) {
-                        preparePathForRelocation(actualPath, builderOwner);
-                        runRelocateScript(*scratchPath, blindSelf, newSelf);
-                    }
-                    rewritePathInPlace(actualPath, blindSelf, newSelf);
-
-                    /* Step 4: Canonicalize metadata and compute final NAR hash */
-                    canonicalisePathMetaData(
-                        actualPath,
-                        {
-#ifndef _WIN32
-                            .uidRange = std::nullopt,
-#endif
-                            NIX_WHEN_SUPPORT_ACLS(localSettings.ignoredAcls)},
-                        inodesSeen);
-
-                    HashResult narHashAndSize = hashPath(
-                        {makeFSSourceAccessor(actualPath), CanonPath::root},
-                        FileSerialisationMethod::NixArchive,
-                        HashAlgorithm::SHA256);
-                    ValidPathInfo newInfo0{caOutPath, {*store, narHashAndSize.hash}};
-                    newInfo0.narSize = narHashAndSize.numBytesDigested;
+                    bool hasCustomRelocate =
+                        S_ISDIR(rootSt.st_mode) && pathExists(actualPath / "nix-support" / "relocate.sh");
 
                     bool discardReferences = false;
                     if (auto udr = get(drvOptions.unsafeDiscardReferences, outputName))
                         discardReferences = *udr;
 
-                    auto refs = rewriteRefs();
-                    newInfo0.references = std::move(refs.others);
-                    if (!discardReferences && (refs.self || narHashAndSize.hash != normalizedNar.hash))
-                        newInfo0.references.insert(newInfo0.path);
+                    std::string outBaseName{output.path.name()};
+                    std::string oldSelf{scratchPath->to_string()};
+                    std::string blindSelf = std::string(StorePath::HashLen, 'x') + "-" + outBaseName;
+
+                    /* Pass 1: Stream $out -> Blinded NAR -> SHA-256 HashSink (Zero Disk Writes) */
+                    StringSink blindedNarSink;
+                    HashSink blindedHashSink(HashAlgorithm::SHA256);
+                    TeeSink pass1Tee(blindedNarSink, blindedHashSink);
+
+                    StringMap siblingRewrites;
+                    for (auto & [sibName, sibFinalPath] : finalOutputs) {
+                        if (auto * sibScratch = get(scratchOutputs, sibName))
+                            if (*sibScratch != sibFinalPath)
+                                siblingRewrites.insert_or_assign(
+                                    std::string{sibScratch->to_string()},
+                                    std::string{sibFinalPath.to_string()});
+                    }
+
+                    if (hasCustomRelocate) {
+                        StringSink currentNar;
+                        dumpPath(actualPath, currentNar);
+                        for (auto & [oldSib, newSib] : siblingRewrites) {
+                            StringSource inSrc(currentNar.s);
+                            StringSink nextNar;
+                            runRelocateScript(*scratchPath, oldSib, newSib, inSrc, nextNar);
+                            currentNar.s = std::move(nextNar.s);
+                        }
+                        StringSource inSrc(currentNar.s);
+                        runRelocateScript(*scratchPath, oldSelf, blindSelf, inSrc, pass1Tee);
+                    } else {
+                        StringMap pass1Rewrites = std::move(siblingRewrites);
+                        pass1Rewrites.insert_or_assign(oldSelf, blindSelf);
+                        auto dumpSource = sinkToSource([&](Sink & dumpSink) {
+                            dumpPath(actualPath, dumpSink);
+                        });
+                        relocateNAR(*dumpSource, pass1Tee, pass1Rewrites);
+                    }
+
+                    HashResult normalizedNar = blindedHashSink.finish();
+                    StorePath caOutPath = store->makeContentAddressedOutputPath(
+                        normalizedNar.hash, outBaseName);
+                    std::string newSelf{caOutPath.to_string()};
+
+                    /* Pass 2: Stream Blinded NAR -> Final NAR -> Unpack + Final Hash + Reference Scan */
+                    StorePathSet postRelocCandidateRefs;
+                    StringSet seenHashParts;
+                    auto addCandidateRef = [&](const StorePath & p) {
+                        std::string hp{p.hashPart()};
+                        if (seenHashParts.insert(hp).second)
+                            postRelocCandidateRefs.insert(p);
+                    };
+                    addCandidateRef(caOutPath);
+                    for (auto & [sibName, sibFinalPath] : finalOutputs)
+                        addCandidateRef(sibFinalPath);
+                    for (auto & p : referenceablePaths) {
+                        if (p == *scratchPath)
+                            continue;
+                        if (auto * sibOutName = get(scratchOutputsInverse, p))
+                            if (finalOutputs.contains(*sibOutName))
+                                continue;
+                        addCandidateRef(p);
+                    }
+
+                    PathRefScanSink postRelocRefScan = PathRefScanSink::fromPaths(postRelocCandidateRefs);
+                    HashSink finalNarHashSink(HashAlgorithm::SHA256);
+
+                    auto [relocTempDir, relocTempDirFd] = localStore.createTempDirInStore();
+                    AutoDelete delRelocTempDir(relocTempDir);
+                    std::filesystem::path tmpOutput = relocTempDir / "x";
+
+                    auto relocatedSource = sinkToSource([&](Sink & restoreSinkIn) {
+                        TeeSink tee1(restoreSinkIn, finalNarHashSink);
+                        TeeSink tee2(tee1, postRelocRefScan);
+                        StringSource blindedSource(blindedNarSink.s);
+                        if (hasCustomRelocate) {
+                            runRelocateScript(*scratchPath, blindSelf, newSelf, blindedSource, tee2);
+                        } else {
+                            relocateNAR(
+                                blindedSource,
+                                tee2,
+                                StringMap{{blindSelf, newSelf}},
+                                discardReferences ? nullptr : &postRelocRefScan);
+                        }
+                    });
+                    restorePath(tmpOutput, *relocatedSource, store->getLocalSettings().fsyncStorePaths);
+                    deletePath(actualPath);
+                    movePath(tmpOutput, actualPath);
+
+                    HashResult narHashAndSize = finalNarHashSink.finish();
+                    ValidPathInfo newInfo0{caOutPath, {*store, narHashAndSize.hash}};
+                    newInfo0.narSize = narHashAndSize.numBytesDigested;
+
+                    if (!discardReferences) {
+                        newInfo0.references = postRelocRefScan.getResultPaths();
+                        if (narHashAndSize.hash != normalizedNar.hash)
+                            newInfo0.references.insert(newInfo0.path);
+                    }
                     return newInfo0;
                 },
 
@@ -783,8 +851,19 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                    new path in place. */
             } else if (localStore.isValidPath(newInfo.path)) {
                 /* Path already exists because CA path produced by something
-                   else. No moving needed. */
+                   else. Verify that the final NAR hash matches before keeping
+                   the existing path on disk. */
                 assert(newInfo.ca || std::holds_alternative<DerivationOutput::InputAddressed>(output->raw));
+                ValidPathInfo oldInfo(*localStore.queryPathInfo(newInfo.path));
+                if (newInfo.narHash != oldInfo.narHash) {
+                    deletePath(actualPath);
+                    throw BuildError(
+                        BuildResult::Failure::OutputRejected,
+                        "NAR hash mismatch for already-valid content-addressed path '%s': expected %s, got %s",
+                        store->printStorePath(newInfo.path),
+                        oldInfo.narHash.to_string(HashFormat::Nix32, true),
+                        newInfo.narHash.to_string(HashFormat::Nix32, true));
+                }
                 /* Can delete our scratch copy now. */
                 deletePath(actualPath);
             } else {

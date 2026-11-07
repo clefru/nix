@@ -102,7 +102,7 @@ StorePath StoreDirConfig::makeOutputPath(std::string_view id, const Hash & hash,
 
 StorePath StoreDirConfig::makeContentAddressedOutputPath(const Hash & narHash, std::string_view name) const
 {
-    return StorePath(compressHash(narHash, 20), name);
+    return makeStorePath("casper:out", narHash, name);
 }
 
 /* Stuff the references (if any) into the type.  This is a bit

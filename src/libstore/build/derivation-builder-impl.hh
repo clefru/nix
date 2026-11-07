@@ -96,13 +96,16 @@ protected:
     }
 
     /**
-     * Execute `$out/nix-support/relocate.sh <target-dir> <old-hash> <new-hash>`
-     * inside the builder environment / sandbox.
+     * Execute `$out/nix-support/relocate.sh <old-self> <new-self>`
+     * inside the builder environment / sandbox, streaming a NAR from
+     * `narIn` (stdin) to `narOut` (stdout).
      */
     virtual void runRelocateScript(
         const StorePath & scratchPath,
-        std::string_view oldHash,
-        std::string_view newHash)
+        std::string_view oldSelf,
+        std::string_view newSelf,
+        Source & narIn,
+        Sink & narOut)
     {
     }
 

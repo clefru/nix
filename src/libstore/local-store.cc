@@ -123,6 +123,7 @@ struct LocalStore::State::Stmts
     SQLiteStmt AddPathRewrite;
     SQLiteStmt QueryPathRewrite;
     SQLiteStmt QueryAllPathRewrites;
+    SQLiteStmt DeletePathRewritesForOutput;
     bool hasPathRewrites = false;
 };
 
@@ -391,6 +392,8 @@ LocalStore::LocalStore(ref<const Config> config)
                 state->db, "select outputPath from PathRewrites where inputPath = ?;");
             state->stmts->QueryAllPathRewrites.create(
                 state->db, "select inputPath, outputPath from PathRewrites;");
+            state->stmts->DeletePathRewritesForOutput.create(
+                state->db, "delete from PathRewrites where outputPath = ? or inputPath = ?;");
         }
     }
     if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations)) {
@@ -797,9 +800,14 @@ std::optional<StorePath> LocalStore::queryPathRewrite_(State & state, const Stor
 
 StorePath LocalStore::resolveInputPath_(State & state, const StorePath & path)
 {
-    if (auto rewritten = queryPathRewrite_(state, path))
-        return *rewritten;
-    return path;
+    StorePath cur = path;
+    for (int hop = 0; hop < 4; ++hop) {
+        auto rewritten = queryPathRewrite_(state, cur);
+        if (!rewritten || *rewritten == cur)
+            break;
+        cur = *rewritten;
+    }
+    return cur;
 }
 
 std::optional<StorePath> LocalStore::queryPathRewrite(const StorePath & inputPath)
@@ -812,9 +820,10 @@ std::optional<StorePath> LocalStore::queryPathRewrite(const StorePath & inputPat
 
 StorePath LocalStore::resolveInputPath(const StorePath & path)
 {
-    if (auto rewritten = queryPathRewrite(path))
-        return *rewritten;
-    return path;
+    return retrySQLite<StorePath>([&]() {
+        auto state(_state->lock());
+        return resolveInputPath_(*state, path);
+    });
 }
 
 StringMap LocalStore::queryAllPathRewrites()
@@ -1155,7 +1164,10 @@ void LocalStore::invalidatePath(State & state, const StorePath & path)
 {
     debug("invalidating path '%s'", printStorePath(path));
 
-    state.stmts->InvalidatePath.use().apply(printStorePath(path)).exec();
+    auto pathStr = printStorePath(path);
+    state.stmts->InvalidatePath.use().apply(pathStr).exec();
+    if (state.stmts->hasPathRewrites)
+        state.stmts->DeletePathRewritesForOutput.use().apply(pathStr).apply(pathStr).exec();
 
     /* Note that the foreign key constraints on the Refs table take
        care of deleting the references entries for `path'. */
