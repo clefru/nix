@@ -1085,6 +1085,14 @@ void ChrootLinuxDerivationBuilder::runRelocateScript(
             std::string extraPath;
             if (!drv.isBuiltin() && drv.builder.starts_with("/"))
                 extraPath = std::filesystem::path(drv.builder).parent_path().native();
+            for (auto & p : inputPaths) {
+                auto binDir = store->printStorePath(p) + "/bin";
+                if (pathExists(binDir)) {
+                    if (!extraPath.empty())
+                        extraPath += ":";
+                    extraPath += binDir;
+                }
+            }
 
             for (auto & i : env) {
                 std::string val = rewriteStrings(i.second, inputRewrites);

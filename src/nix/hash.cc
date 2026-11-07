@@ -3,13 +3,252 @@
 #include "nix/cmd/legacy.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/references.hh"
+#include "nix/store/local-fs-store.hh"
+#include "nix/store/store-open.hh"
+#include "nix/util/archive.hh"
 #include "nix/util/git.hh"
+#include "nix/util/processes.hh"
 #include "nix/util/source-accessor.hh"
 #include "nix/cmd/misc-store-flags.hh"
 #include "man-pages.hh"
 #include "nix/util/fun.hh"
 
+#include <thread>
+#include <unistd.h>
+#ifdef __linux__
+#  include <sched.h>
+#  include <sys/mount.h>
+#endif
+
 namespace nix {
+
+static void verifyCasperPath(const std::string & pathStr, std::shared_ptr<Store> store = nullptr)
+{
+    StoreDirConfig storeCfg{"/nix/store"};
+    std::filesystem::path realPath;
+    std::filesystem::path realStoreDir;
+    std::optional<StorePath> optSp;
+
+    if (pathExists(pathStr)) {
+        auto absP = absPath(pathStr);
+        realPath = absP;
+        realStoreDir = absP.parent_path();
+        optSp = StorePath(absP.filename().native());
+    } else {
+        if (!store)
+            store = openStore();
+        auto sp = store->parseStorePath(pathStr);
+        auto localFsStore = std::dynamic_pointer_cast<LocalFSStore>(store);
+        if (!localFsStore)
+            throw Error("CASPER verification requires a local filesystem store");
+        realPath = localFsStore->toRealPath(sp);
+        realStoreDir = realPath.parent_path();
+        optSp = sp;
+    }
+
+    if (!pathExists(realPath))
+        throw Error("path '%s' does not exist", PathFmt(realPath));
+
+    StorePath sp = *optSp;
+    std::string currentSelf{sp.to_string()};
+    std::string outBaseName{sp.name()};
+
+    auto rootSt = lstat(realPath);
+    auto relocateScriptPath = realPath / "nix-support" / "relocate.sh";
+    bool hasCustomRelocate =
+        S_ISDIR(rootSt.st_mode) && pathExists(relocateScriptPath);
+
+    std::string blindSelf;
+    HashSink blindedHashSink(HashAlgorithm::SHA256);
+
+    if (hasCustomRelocate) {
+        auto scriptSt = lstat(relocateScriptPath);
+        if (!S_ISLNK(scriptSt.st_mode))
+            throw Error(
+                "CASPER verification failed for '%s': nix-support/relocate.sh must be a symlink to a store path",
+                PathFmt(realPath));
+
+        auto linkTarget = readLink(relocateScriptPath).native();
+        auto [relocatorStorePath, relSubPath] = storeCfg.toStorePath(linkTarget);
+
+        if (hasPrefix(relocatorStorePath.name(), outBaseName))
+            throw Error(
+                "CASPER verification failed for '%s': relocate.sh target '%s' starts with output name '%s'",
+                PathFmt(realPath),
+                linkTarget,
+                outBaseName);
+
+        blindSelf = std::string{relocatorStorePath.hashPart()} + "-" + outBaseName;
+
+        std::filesystem::path relocatorExec = realStoreDir / std::string{relocatorStorePath.to_string()};
+        if (!relSubPath.isRoot())
+            relocatorExec /= relSubPath.rel();
+
+        if (!pathExists(relocatorExec))
+            throw Error(
+                "CASPER verification failed for '%s': relocator target '%s' does not exist at '%s'",
+                PathFmt(realPath),
+                linkTarget,
+                PathFmt(relocatorExec));
+
+        Pipe inPipe, outPipe, errPipe;
+        inPipe.create();
+        outPipe.create();
+        errPipe.create();
+
+        Pid child(startProcess([&]() {
+            try {
+                inPipe.writeSide.close();
+                outPipe.readSide.close();
+                errPipe.readSide.close();
+
+                if (dup2(inPipe.readSide.get(), STDIN_FILENO) == -1)
+                    _exit(1);
+                if (dup2(outPipe.writeSide.get(), STDOUT_FILENO) == -1)
+                    _exit(1);
+                if (dup2(errPipe.writeSide.get(), STDERR_FILENO) == -1)
+                    _exit(1);
+
+                inPipe.readSide.close();
+                outPipe.writeSide.close();
+                errPipe.writeSide.close();
+
+                std::string extraPath = "/bin:/usr/bin:/run/current-system/sw/bin";
+                for (auto & entry : DirectoryIterator{realStoreDir}) {
+                    auto name = entry.path().filename().native();
+                    if (name.find("-coreutils-") != std::string::npos
+                        || name.find("-gnused-") != std::string::npos
+                        || name.find("-gnugrep-") != std::string::npos
+                        || name.find("-findutils-") != std::string::npos
+                        || name.find("-gzip-") != std::string::npos
+                        || name.find("-bash-") != std::string::npos) {
+                        auto binPath = entry.path() / "bin";
+                        if (pathExists(binPath))
+                            extraPath += ":" + binPath.native();
+                    }
+                }
+
+                Strings directArgs{
+                    relocatorExec.native(),
+                    currentSelf,
+                    blindSelf,
+                };
+                Strings envStrs{"LC_ALL=C", "PATH=" + extraPath};
+                execve(relocatorExec.c_str(), stringsToCharPtrs(directArgs).data(), stringsToCharPtrs(envStrs).data());
+
+                Strings shArgs{
+                    "sh",
+                    relocatorExec.native(),
+                    currentSelf,
+                    blindSelf,
+                };
+                execve("/bin/sh", stringsToCharPtrs(shArgs).data(), stringsToCharPtrs(envStrs).data());
+            } catch (...) {
+            }
+            _exit(1);
+        }));
+
+        inPipe.readSide.close();
+        outPipe.writeSide.close();
+        errPipe.writeSide.close();
+
+        std::exception_ptr writerException;
+        std::thread writerThread([&]() {
+            try {
+                FdSink inSink(inPipe.writeSide.get());
+                dumpPath(realPath.native(), inSink);
+                inSink.flush();
+            } catch (SysError & e) {
+                if (e.errNo != EPIPE)
+                    writerException = std::current_exception();
+            } catch (...) {
+                writerException = std::current_exception();
+            }
+            inPipe.writeSide.close();
+        });
+
+        std::string errOutput;
+        std::thread errThread([&]() {
+            try {
+                errOutput = drainFD(errPipe.readSide.get());
+            } catch (...) {
+            }
+            errPipe.readSide.close();
+        });
+
+        std::exception_ptr readerException;
+        try {
+            FdSource outSource(outPipe.readSide.get());
+            copyNAR(outSource, blindedHashSink);
+        } catch (...) {
+            readerException = std::current_exception();
+        }
+        outPipe.readSide.close();
+
+        writerThread.join();
+        errThread.join();
+
+        int status = child.wait();
+        if (!statusOk(status))
+            throw Error(
+                "CASPER verification failed for '%s': relocate.sh (%s)%s%s",
+                PathFmt(realPath),
+                statusToString(status),
+                errOutput.empty() ? "" : ": ",
+                trim(errOutput));
+        if (writerException)
+            std::rethrow_exception(writerException);
+        if (readerException)
+            std::rethrow_exception(readerException);
+    } else {
+        blindSelf = std::string(StorePath::HashLen, 'x') + "-" + outBaseName;
+        auto dumpSource = sinkToSource([&](Sink & dumpSink) {
+            dumpPath(realPath.native(), dumpSink);
+        });
+        relocateNAR(*dumpSource, blindedHashSink, StringMap{{currentSelf, blindSelf}});
+    }
+
+    Hash blindedNarHash = blindedHashSink.finish().hash;
+    StorePath recomputedPath = storeCfg.makeContentAddressedOutputPath(blindedNarHash, outBaseName);
+
+    if (recomputedPath != sp) {
+        throw Error(
+            "CASPER hash mismatch for '%s': expected '%s', recomputed '%s' (blindTarget='%s', blindedNarSha256='%s')",
+            PathFmt(realPath),
+            sp.to_string(),
+            recomputedPath.to_string(),
+            blindSelf,
+            blindedNarHash.to_string(HashFormat::Nix32, false));
+    }
+
+    logger->cout(
+        "%s (verified: path=%s, blindTarget=%s, blindedNarSha256=%s)",
+        recomputedPath.hashPart(),
+        storeCfg.printStorePath(recomputedPath),
+        blindSelf,
+        blindedNarHash.to_string(HashFormat::Nix32, false));
+}
+
+struct CmdHashCasper : StoreCommand
+{
+    std::vector<std::string> paths;
+
+    CmdHashCasper()
+    {
+        expectArgs({.label = "paths", .handler = {&paths}, .completer = completePath});
+    }
+
+    std::string description() override
+    {
+        return "recompute and verify the CASPER content-addressed store hash of a path";
+    }
+
+    void run(ref<Store> store) override
+    {
+        for (const auto & p : paths)
+            verifyCasperPath(p, store.get_ptr());
+    }
+};
 
 /**
  * Base for `nix hash path`, `nix hash file` (deprecated), and `nix-hash` (legacy).
@@ -263,6 +502,7 @@ struct CmdHash : NixMultiCommand
         : NixMultiCommand(
               "hash",
               {
+                  {"casper", []() { return make_ref<CmdHashCasper>(); }},
                   {"convert", []() { return make_ref<CmdHashConvert>(); }},
                   {"path", []() { return make_ref<CmdHashPath>(); }},
                   {"file", []() { return make_ref<CmdHashFile>(); }},
@@ -298,7 +538,7 @@ static int compatNixHash(int argc, char ** argv)
     HashFormat hashFormat = HashFormat::Base16;
     bool truncate = false;
 
-    enum { opHash, opTo } op = opHash;
+    enum { opHash, opTo, opCasper } op = opHash;
 
     std::vector<std::string> ss;
 
@@ -307,6 +547,8 @@ static int compatNixHash(int argc, char ** argv)
             showManPage("nix-hash");
         else if (*arg == "--version")
             printVersion("nix-hash");
+        else if (*arg == "--casper")
+            op = opCasper;
         else if (*arg == "--flat")
             flat = true;
         else if (*arg == "--base16")
@@ -341,7 +583,12 @@ static int compatNixHash(int argc, char ** argv)
         return true;
     });
 
-    if (op == opHash) {
+    if (op == opCasper) {
+        for (const auto & p : ss)
+            verifyCasperPath(p);
+    }
+
+    else if (op == opHash) {
         CmdHashBase cmd(flat ? FileIngestionMethod::Flat : FileIngestionMethod::NixArchive);
         if (!hashAlgo.has_value())
             hashAlgo = HashAlgorithm::MD5;

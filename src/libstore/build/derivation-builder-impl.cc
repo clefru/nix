@@ -104,7 +104,7 @@ static void replaceValidPath(const std::filesystem::path & storePath, const std:
         deletePath(oldPath);
 }
 
-static void relocateNAR(
+void relocateNAR(
     Source & source,
     Sink & sink,
     const StringMap & rewrites)
@@ -635,8 +635,9 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                 [&](const DerivationOutput::InputAddressed & output) {
                     /* CASPER: Pure NAR -> NAR Stream Blinding & Embedded Relocation */
                     auto rootSt = lstat(actualPath);
+                    auto relocateScriptPath = actualPath / "nix-support" / "relocate.sh";
                     bool hasCustomRelocate =
-                        S_ISDIR(rootSt.st_mode) && pathExists(actualPath / "nix-support" / "relocate.sh");
+                        S_ISDIR(rootSt.st_mode) && pathExists(relocateScriptPath);
 
                     bool discardReferences = false;
                     if (auto udr = get(drvOptions.unsafeDiscardReferences, outputName))
@@ -644,7 +645,42 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
 
                     std::string outBaseName{output.path.name()};
                     std::string oldSelf{scratchPath->to_string()};
-                    std::string blindSelf = std::string(StorePath::HashLen, 'x') + "-" + outBaseName;
+                    std::string blindSelf;
+
+                    if (hasCustomRelocate) {
+                        auto scriptSt = lstat(relocateScriptPath);
+                        if (!S_ISLNK(scriptSt.st_mode))
+                            throw BuildError(
+                                BuildResult::Failure::OutputRejected,
+                                "relocate.sh in '%s' must be a symlink to a store path",
+                                store->printStorePath(*scratchPath));
+
+                        auto linkTarget = readLink(relocateScriptPath).native();
+                        StorePath relocatorStorePath = [&]() {
+                            try {
+                                return store->toStorePath(linkTarget).first;
+                            } catch (Error & e) {
+                                throw BuildError(
+                                    BuildResult::Failure::OutputRejected,
+                                    "relocate.sh in '%s' must point to a valid store path (got '%s'): %s",
+                                    store->printStorePath(*scratchPath),
+                                    linkTarget,
+                                    e.what());
+                            }
+                        }();
+
+                        if (hasPrefix(relocatorStorePath.name(), outBaseName))
+                            throw BuildError(
+                                BuildResult::Failure::OutputRejected,
+                                "relocate.sh target '%s' in '%s' must not start with the output store path name '%s'",
+                                store->printStorePath(relocatorStorePath),
+                                store->printStorePath(*scratchPath),
+                                outBaseName);
+
+                        blindSelf = std::string{relocatorStorePath.hashPart()} + "-" + outBaseName;
+                    } else {
+                        blindSelf = std::string(StorePath::HashLen, 'x') + "-" + outBaseName;
+                    }
 
                     /* Pass 1: Stream $out -> Blinded NAR -> SHA-256 HashSink (Zero Disk Writes) */
                     StringSink blindedNarSink;

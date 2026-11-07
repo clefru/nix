@@ -67,4 +67,9 @@ public:
     HashResult finish() override;
 };
 
+void relocateNAR(
+    Source & source,
+    Sink & sink,
+    const StringMap & rewrites);
+
 } // namespace nix
