@@ -696,6 +696,7 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                                     std::string{sibFinalPath.to_string()});
                     }
 
+                    std::optional<Hash> prePass1Hash;
                     if (hasCustomRelocate) {
                         StringSink currentNar;
                         dumpPath(actualPath, currentNar);
@@ -705,6 +706,7 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                             runRelocateScript(*scratchPath, oldSib, newSib, inSrc, nextNar);
                             currentNar.s = std::move(nextNar.s);
                         }
+                        prePass1Hash = hashString(HashAlgorithm::SHA256, currentNar.s);
                         StringSource inSrc(currentNar.s);
                         runRelocateScript(*scratchPath, oldSelf, blindSelf, inSrc, pass1Tee);
                     } else {
@@ -766,6 +768,49 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                     movePath(tmpOutput, actualPath);
 
                     HashResult narHashAndSize = finalNarHashSink.finish();
+
+                    /* Pass 3: Fixed-point verification (re-blind newSelf -> blindSelf on the
+                       unpacked output and verify the hash matches Pass 1's normalizedNar.hash). */
+                    if (prePass1Hash && normalizedNar.hash != *prePass1Hash
+                        && blindSelf != newSelf && narHashAndSize.hash == normalizedNar.hash) {
+                        throw BuildError(
+                            BuildResult::Failure::OutputRejected,
+                            "CASPER Pass 3 fixed-point verification failed for '%s': Pass 1 modified the output when blinding '%s' -> '%s', but Pass 2 ('%s' -> '%s') left the output unchanged",
+                            store->printStorePath(*scratchPath),
+                            oldSelf,
+                            blindSelf,
+                            blindSelf,
+                            newSelf);
+                    }
+                    if (hasCustomRelocate || narHashAndSize.hash != normalizedNar.hash) {
+                        HashSink pass3HashSink(HashAlgorithm::SHA256);
+                        if (hasCustomRelocate) {
+                            StringSink pass2Nar;
+                            dumpPath(actualPath, pass2Nar);
+                            StringSource pass3In(pass2Nar.s);
+                            runRelocateScript(*scratchPath, newSelf, blindSelf, pass3In, pass3HashSink);
+                        } else {
+                            auto pass3DumpSource = sinkToSource([&](Sink & dumpSink) {
+                                dumpPath(actualPath, dumpSink);
+                            });
+                            relocateNAR(
+                                *pass3DumpSource,
+                                pass3HashSink,
+                                StringMap{{newSelf, blindSelf}});
+                        }
+                        HashResult pass3Nar = pass3HashSink.finish();
+                        if (pass3Nar.hash != normalizedNar.hash) {
+                            throw BuildError(
+                                BuildResult::Failure::OutputRejected,
+                                "CASPER Pass 3 fixed-point verification failed for '%s': Pass 1 blinded hash '%s' != Pass 3 re-blinded hash '%s' (blindSelf='%s', newSelf='%s')",
+                                store->printStorePath(*scratchPath),
+                                normalizedNar.hash.to_string(HashFormat::Nix32, true),
+                                pass3Nar.hash.to_string(HashFormat::Nix32, true),
+                                blindSelf,
+                                newSelf);
+                        }
+                    }
+
                     ValidPathInfo newInfo0{caOutPath, {*store, narHashAndSize.hash}};
                     newInfo0.narSize = narHashAndSize.numBytesDigested;
 
