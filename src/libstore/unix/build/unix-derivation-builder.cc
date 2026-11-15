@@ -989,6 +989,9 @@ void UnixDerivationBuilderImpl::execBuilder(const Strings & args, const Strings 
 
 void UnixDerivationBuilderImpl::runRelocateScript(
     const StorePath & scratchPath,
+    const StorePath & relocatorStorePath,
+    const std::string & relocatorSubPath,
+    const StorePathSet & relocClosure,
     const Strings & relocArgs,
     Source & narIn,
     Sink & narOut,
@@ -999,12 +1002,44 @@ void UnixDerivationBuilderImpl::runRelocateScript(
         return;
     }
 
-    auto targetDir = realPathInHost(scratchPath);
-    auto scriptPath = targetDir / "nix-support" / "relocate.sh";
-    if (!pathExists(scriptPath)) {
-        copyNAR(narIn, narOut);
-        return;
+    std::filesystem::path hostExecPath = store->toRealPath(relocatorStorePath);
+    if (!relocatorSubPath.empty())
+        hostExecPath /= relocatorSubPath;
+    if (!pathExists(hostExecPath))
+        throw BuildError(
+            BuildResult::Failure::OutputRejected,
+            "relocate.sh target '%s' for '%s' does not exist",
+            PathFmt(hostExecPath),
+            store->printStorePath(scratchPath));
+
+    std::string relocBinPath;
+    std::string closureShell;
+    for (const auto & p : relocClosure) {
+        auto hostBin = store->toRealPath(p) / "bin";
+        if (pathExists(hostBin)) {
+            if (!relocBinPath.empty())
+                relocBinPath += ":";
+            relocBinPath += hostBin.native();
+            if (closureShell.empty()) {
+                for (auto * shName : {"sh", "bash", "ash", "dash"}) {
+                    auto cand = hostBin / shName;
+                    if (pathExists(cand)) {
+                        closureShell = cand.native();
+                        break;
+                    }
+                }
+            }
+        }
     }
+    if (!relocBinPath.empty())
+        relocBinPath += ":/bin:/usr/bin";
+    else
+        relocBinPath = "/bin:/usr/bin";
+
+    std::filesystem::path relocTmpDir = createTempDir();
+    AutoDelete delRelocTmpDir(relocTmpDir, true);
+    chmod(relocTmpDir, 0700);
+    chownToBuilder(relocTmpDir);
 
     Pipe inPipe, outPipe, errPipe, scanPipe;
     inPipe.create();
@@ -1049,42 +1084,37 @@ void UnixDerivationBuilderImpl::runRelocateScript(
                 unix::closeExtraFDs();
             }
             setUser();
+            if (chdir(relocTmpDir.c_str()) == -1)
+                _exit(1);
 
-            Strings envStrs;
-            bool hasPath = false;
-            std::string extraPath;
-            if (!drv.isBuiltin() && drv.builder.starts_with("/"))
-                extraPath = std::filesystem::path(drv.builder).parent_path().native();
+            Strings envStrs{
+                "LC_ALL=C",
+                "HOME=/homeless-shelter",
+                "PATH=" + relocBinPath,
+                "TMPDIR=" + relocTmpDir.native(),
+                "TEMPDIR=" + relocTmpDir.native(),
+                "TMP=" + relocTmpDir.native(),
+                "TEMP=" + relocTmpDir.native(),
+            };
 
-            for (auto & i : env) {
-                std::string val = rewriteStrings(i.second, inputRewrites);
-                if (i.first == "PATH") {
-                    hasPath = true;
-                    if (!extraPath.empty())
-                        val += ":" + extraPath;
-                }
-                envStrs.push_back(i.first + "=" + val);
-            }
-            if (!hasPath && !extraPath.empty())
-                envStrs.push_back("PATH=" + extraPath);
-
-            Strings directArgs{scriptPath.native()};
+            Strings directArgs{hostExecPath.native()};
             for (auto & a : relocArgs)
                 directArgs.push_back(a);
-            execve(scriptPath.c_str(), stringsToCharPtrs(directArgs).data(), stringsToCharPtrs(envStrs).data());
+            execve(hostExecPath.c_str(), stringsToCharPtrs(directArgs).data(), stringsToCharPtrs(envStrs).data());
 
             std::string shell = "/bin/sh";
-            if (!pathExists(shell) && !drv.isBuiltin()
-                && (hasSuffix(drv.builder, "/sh") || hasSuffix(drv.builder, "/bash")
-                    || hasSuffix(drv.builder, "/ash") || hasSuffix(drv.builder, "/dash"))
-                && pathExists(drv.builder)) {
-                shell = drv.builder;
-            }
+            if (!pathExists(shell) && !closureShell.empty() && pathExists(closureShell))
+                shell = closureShell;
 
-            Strings args{"sh", scriptPath.native()};
+            Strings args{"sh", hostExecPath.native()};
             for (auto & a : relocArgs)
                 args.push_back(a);
             execve(shell.c_str(), stringsToCharPtrs(args).data(), stringsToCharPtrs(envStrs).data());
+        } catch (std::exception & e) {
+            try {
+                writeFull(STDERR_FILENO, fmt("%s\n", e.what()));
+            } catch (...) {
+            }
         } catch (...) {
         }
         _exit(1);

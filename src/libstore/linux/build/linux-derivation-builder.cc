@@ -1016,6 +1016,9 @@ void ChrootLinuxDerivationBuilder::addDependencyImpl(const StorePath & path)
 
 void ChrootLinuxDerivationBuilder::runRelocateScript(
     const StorePath & scratchPath,
+    const StorePath & relocatorStorePath,
+    const std::string & relocatorSubPath,
+    const StorePathSet & relocClosure,
     const Strings & relocArgs,
     Source & narIn,
     Sink & narOut,
@@ -1027,15 +1030,69 @@ void ChrootLinuxDerivationBuilder::runRelocateScript(
     }
 
     if (sandboxMountNamespace.get() == -1) {
-        UnixDerivationBuilderImpl::runRelocateScript(scratchPath, relocArgs, narIn, narOut, scanOut);
+        UnixDerivationBuilderImpl::runRelocateScript(
+            scratchPath, relocatorStorePath, relocatorSubPath, relocClosure, relocArgs, narIn, narOut, scanOut);
         return;
     }
 
-    auto hostScriptPath = realPathInHost(scratchPath) / "nix-support" / "relocate.sh";
-    if (!pathExists(hostScriptPath)) {
-        copyNAR(narIn, narOut);
-        return;
+    std::filesystem::path hostExecPath = store->toRealPath(relocatorStorePath);
+    if (!relocatorSubPath.empty())
+        hostExecPath /= relocatorSubPath;
+    if (!pathExists(hostExecPath))
+        throw BuildError(
+            BuildResult::Failure::OutputRejected,
+            "relocate.sh target '%s' for '%s' does not exist",
+            PathFmt(hostExecPath),
+            store->printStorePath(scratchPath));
+
+    std::string inSandboxExec = store->printStorePath(relocatorStorePath);
+    if (!relocatorSubPath.empty())
+        inSandboxExec += "/" + relocatorSubPath;
+
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> closureMounts;
+    std::set<std::filesystem::path> mountedRelPaths;
+    for (const auto & p : relocClosure) {
+        auto relDst = std::filesystem::path(store->printStorePath(p)).relative_path();
+        if (mountedRelPaths.insert(relDst).second)
+            closureMounts.emplace_back(store->toRealPath(p), std::move(relDst));
     }
+    for (const auto & [dst, chrootPath] : defaultPathsInChroot) {
+        if (chrootPath.source == "__embedded_sandbox_shell__")
+            continue;
+        if (isInDir(dst, store->storeDir)) {
+            auto relDst = dst.relative_path();
+            if (mountedRelPaths.insert(relDst).second)
+                closureMounts.emplace_back(chrootPath.source, std::move(relDst));
+        }
+    }
+
+    std::string relocBinPath;
+    std::string closureShell;
+    for (const auto & p : relocClosure) {
+        auto hostBin = store->toRealPath(p) / "bin";
+        if (pathExists(hostBin)) {
+            auto sbBin = store->printStorePath(p) + "/bin";
+            if (!relocBinPath.empty())
+                relocBinPath += ":";
+            relocBinPath += sbBin;
+            if (closureShell.empty()) {
+                for (auto * shName : {"sh", "bash", "ash", "dash"}) {
+                    if (pathExists(hostBin / shName)) {
+                        closureShell = sbBin + "/" + shName;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (!relocBinPath.empty())
+        relocBinPath += ":/bin";
+    else
+        relocBinPath = "/bin";
+
+    auto storeDirRel = std::filesystem::path(store->storeDir).relative_path();
+    auto buildDirRel = tmpDirInSandbox().relative_path();
+    std::string shmMountOpts = fmt("size=%s,mode=1777", store->getLocalSettings().sandboxShmSize.get());
 
     Pipe inPipe, outPipe, errPipe, scanPipe;
     inPipe.create();
@@ -1066,16 +1123,62 @@ void ChrootLinuxDerivationBuilder::runRelocateScript(
             if (!buildUser)
                 setgroups(0, 0);
             if (usingUserNamespace && (setns(sandboxUserNamespace.get(), CLONE_NEWUSER) == -1))
-                _exit(1);
+                throw SysError("entering sandbox user namespace for relocate");
             if (setns(sandboxMountNamespace.get(), CLONE_NEWNS) == -1)
-                _exit(1);
-            if (derivationType.isSandboxed()) {
-                unshare(CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWNS);
+                throw SysError("entering sandbox mount namespace for relocate");
+
+            int unshareFlags =
+                CLONE_NEWNS | (derivationType.isSandboxed() ? (CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS) : 0);
+            if (unshare(unshareFlags) == -1)
+                throw SysError("unsharing relocate namespaces");
+            if (mount(0, "/", 0, MS_PRIVATE | MS_REC, 0) == -1)
+                throw SysError("making '/' private for relocate");
+
+            /* Mount an isolated store tmpfs populated strictly with relocClosure
+               (and system defaultPathsInChroot), hiding $out, sibling outputs,
+               and any other drv.inputPaths. */
+            auto chrootStoreDir = chrootRootDir / storeDirRel;
+            if (mount("none", chrootStoreDir.c_str(), "tmpfs", 0, "mode=0755") == -1)
+                throw SysError("mounting isolated store tmpfs for relocate");
+            {
+                AutoCloseFD chrootRootDirFd = openDirectory(chrootRootDir, FinalSymlink::DontFollow);
+                if (!chrootRootDirFd)
+                    throw SysError("opening chroot directory %s", PathFmt(chrootRootDir));
+                for (const auto & [src, relDst] : closureMounts)
+                    doBind(src, chrootRootDirFd.get(), relDst, chrootRootDir);
             }
+            if (mount("none", chrootStoreDir.c_str(), "tmpfs", MS_REMOUNT | MS_RDONLY | MS_NODEV | MS_NOSUID, "mode=0555")
+                == -1)
+                chmod(chrootStoreDir, 0555);
+
+            /* Mount fresh ephemeral /tmp and /dev/shm, and hide /build under an
+               empty read-only tmpfs so nothing staged by the builder can leak in. */
+            auto chrootTmpDir = chrootRootDir / "tmp";
+            createDirs(chrootTmpDir);
+            if (mount("none", chrootTmpDir.c_str(), "tmpfs", 0, "mode=1777") == -1)
+                throw SysError("mounting ephemeral /tmp for relocate");
+
+            auto chrootShmDir = chrootRootDir / "dev" / "shm";
+            if (pathExists(chrootShmDir)) {
+                if (mount("none", chrootShmDir.c_str(), "tmpfs", 0, shmMountOpts.c_str()) == -1)
+                    throw SysError("mounting ephemeral /dev/shm for relocate");
+            }
+
+            if (!buildDirRel.empty() && buildDirRel != "tmp") {
+                auto chrootBuildDir = chrootRootDir / buildDirRel;
+                if (pathExists(chrootBuildDir)) {
+                    if (mount("none", chrootBuildDir.c_str(), "tmpfs", MS_RDONLY | MS_NODEV | MS_NOSUID, "mode=0555,size=4k")
+                        == -1)
+                        throw SysError("hiding sandbox build directory for relocate");
+                }
+            }
+
             if (chdir(chrootRootDir.c_str()) == -1)
-                _exit(1);
+                throw SysError("chdir to chrootRootDir for relocate");
             if (chroot(".") == -1)
-                _exit(1);
+                throw SysError("chroot for relocate");
+            if (chdir("/tmp") == -1)
+                throw SysError("chdir to /tmp for relocate");
 
             if (scanOut) {
                 if (scanPipe.writeSide.get() != 3) {
@@ -1096,52 +1199,34 @@ void ChrootLinuxDerivationBuilder::runRelocateScript(
             LinuxDerivationBuilder::enterChroot();
             setUser();
 
-            auto targetDir = store->printStorePath(scratchPath);
-            auto scriptInSandbox = targetDir + "/nix-support/relocate.sh";
+            Strings envStrs{
+                "LC_ALL=C",
+                "HOME=/homeless-shelter",
+                "PATH=" + relocBinPath,
+                "TMPDIR=/tmp",
+                "TEMPDIR=/tmp",
+                "TMP=/tmp",
+                "TEMP=/tmp",
+            };
 
-            Strings envStrs;
-            bool hasPath = false;
-            std::string extraPath;
-            if (!drv.isBuiltin() && drv.builder.starts_with("/"))
-                extraPath = std::filesystem::path(drv.builder).parent_path().native();
-            for (auto & p : inputPaths) {
-                auto binDir = store->printStorePath(p) + "/bin";
-                if (pathExists(binDir)) {
-                    if (!extraPath.empty())
-                        extraPath += ":";
-                    extraPath += binDir;
-                }
-            }
-
-            for (auto & i : env) {
-                std::string val = rewriteStrings(i.second, inputRewrites);
-                if (i.first == "PATH") {
-                    hasPath = true;
-                    if (!extraPath.empty())
-                        val += ":" + extraPath;
-                }
-                envStrs.push_back(i.first + "=" + val);
-            }
-            if (!hasPath && !extraPath.empty())
-                envStrs.push_back("PATH=" + extraPath);
-
-            Strings directArgs{scriptInSandbox};
+            Strings directArgs{inSandboxExec};
             for (auto & a : relocArgs)
                 directArgs.push_back(a);
-            execve(scriptInSandbox.c_str(), stringsToCharPtrs(directArgs).data(), stringsToCharPtrs(envStrs).data());
+            execve(inSandboxExec.c_str(), stringsToCharPtrs(directArgs).data(), stringsToCharPtrs(envStrs).data());
 
             std::string shell = "/bin/sh";
-            if (!pathExists(shell) && !drv.isBuiltin()
-                && (hasSuffix(drv.builder, "/sh") || hasSuffix(drv.builder, "/bash")
-                    || hasSuffix(drv.builder, "/ash") || hasSuffix(drv.builder, "/dash"))
-                && pathExists(drv.builder)) {
-                shell = drv.builder;
-            }
+            if (!pathExists(shell) && !closureShell.empty() && pathExists(closureShell))
+                shell = closureShell;
 
-            Strings args{"sh", scriptInSandbox};
+            Strings args{"sh", inSandboxExec};
             for (auto & a : relocArgs)
                 args.push_back(a);
             execve(shell.c_str(), stringsToCharPtrs(args).data(), stringsToCharPtrs(envStrs).data());
+        } catch (std::exception & e) {
+            try {
+                writeFull(STDERR_FILENO, fmt("%s\n", e.what()));
+            } catch (...) {
+            }
         } catch (...) {
         }
         _exit(1);

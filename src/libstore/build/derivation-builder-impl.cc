@@ -6,6 +6,7 @@
 #include "nix/store/posix-fs-canonicalise.hh"
 #include "nix/store/restricted-store.hh"
 #include "nix/util/archive.hh"
+#include "nix/util/fs-sink.hh"
 #include "nix/util/file-content-address.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/git.hh"
@@ -232,6 +233,208 @@ void relocateNAR(
     }(sink, 0);
 }
 
+namespace {
+
+struct RelocatorLinkCheckSink : NullFileSystemObjectSink
+{
+    bool rootIsDir = false;
+    bool nixSupportIsDir = false;
+    bool seenRelocateSymlink = false;
+    bool seenNonSymlinkRelocate = false;
+    std::string relocateTarget;
+
+    void createDirectory(const CanonPath & path) override
+    {
+        if (path.isRoot())
+            rootIsDir = true;
+        else if (path.rel() == "nix-support")
+            nixSupportIsDir = true;
+        else if (path.rel() == "nix-support/relocate.sh")
+            seenNonSymlinkRelocate = true;
+    }
+
+    void createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> cb) override
+    {
+        if (path.rel() == "nix-support/relocate.sh")
+            seenNonSymlinkRelocate = true;
+        NullFileSystemObjectSink::createRegularFile(path, std::move(cb));
+    }
+
+    void createSymlink(const CanonPath & path, const std::string & target) override
+    {
+        if (path.rel() == "nix-support/relocate.sh") {
+            seenRelocateSymlink = true;
+            relocateTarget = target;
+        }
+    }
+
+    bool matchesExpected(std::string_view expectedTarget) const
+    {
+        return rootIsDir && nixSupportIsDir && !seenNonSymlinkRelocate && seenRelocateSymlink
+            && relocateTarget == expectedTarget;
+    }
+};
+
+struct OutputRelocatorInfo
+{
+    std::string linkTarget;
+    StorePath storePath;
+    std::string subPath;
+    StorePathSet closure;
+};
+
+void verifyRelocatorLinkInNar(
+    const StoreDirConfig & storeCfg,
+    const StorePath & scratchPath,
+    std::string_view narBytes,
+    std::string_view expectedTarget,
+    std::string_view stageDesc)
+{
+    RelocatorLinkCheckSink checkSink;
+    StringSource src{narBytes};
+    parseDump(checkSink, src);
+    if (!checkSink.matchesExpected(expectedTarget)) {
+        throw BuildError(
+            BuildResult::Failure::OutputRejected,
+            "CASPER relocator integrity check failed for '%s' during %s: output NAR must preserve real directory 'nix-support' and symlink 'nix-support/relocate.sh' -> '%s' (got %s)",
+            storeCfg.printStorePath(scratchPath),
+            stageDesc,
+            expectedTarget,
+            checkSink.seenRelocateSymlink ? "'" + checkSink.relocateTarget + "'" : "<missing or non-symlink>");
+    }
+}
+
+void verifyUnpackedRelocatorLink(
+    const StoreDirConfig & storeCfg,
+    const StorePath & scratchPath,
+    const std::filesystem::path & actualPath,
+    std::string_view expectedTarget)
+{
+    auto rootSt = lstat(actualPath);
+    auto nixSupportSt = S_ISDIR(rootSt.st_mode) ? maybeLstat(actualPath / "nix-support") : std::nullopt;
+    auto scriptSt =
+        (nixSupportSt && S_ISDIR(nixSupportSt->st_mode)) ? maybeLstat(actualPath / "nix-support" / "relocate.sh")
+                                                         : std::nullopt;
+    if (!scriptSt || !S_ISLNK(scriptSt->st_mode)
+        || readLink(actualPath / "nix-support" / "relocate.sh").native() != expectedTarget) {
+        throw BuildError(
+            BuildResult::Failure::OutputRejected,
+            "CASPER relocator integrity check failed for '%s' after Pass 2: unpacked output must preserve real directory 'nix-support' and symlink 'nix-support/relocate.sh' -> '%s'",
+            storeCfg.printStorePath(scratchPath),
+            expectedTarget);
+    }
+}
+
+std::optional<OutputRelocatorInfo> inspectOutputRelocator(
+    LocalStore & localStore,
+    const StoreDirConfig & storeCfg,
+    const StorePath & scratchPath,
+    const std::filesystem::path & actualPath,
+    std::string_view outBaseName,
+    const StorePathSet & referenceablePaths,
+    const std::map<StorePath, std::string> & scratchOutputsInverse)
+{
+    auto rootSt = lstat(actualPath);
+    if (!S_ISDIR(rootSt.st_mode))
+        return std::nullopt;
+
+    auto nixSupportPath = actualPath / "nix-support";
+    auto nixSupportSt = maybeLstat(nixSupportPath);
+    if (!nixSupportSt)
+        return std::nullopt;
+
+    if (!S_ISDIR(nixSupportSt->st_mode)) {
+        if (S_ISLNK(nixSupportSt->st_mode) && maybeLstat(nixSupportPath / "relocate.sh")) {
+            throw BuildError(
+                BuildResult::Failure::OutputRejected,
+                "'nix-support' in '%s' must be a real directory when 'relocate.sh' is present, not a symlink",
+                storeCfg.printStorePath(scratchPath));
+        }
+        return std::nullopt;
+    }
+
+    auto relocateScriptPath = nixSupportPath / "relocate.sh";
+    auto scriptSt = maybeLstat(relocateScriptPath);
+    if (!scriptSt)
+        return std::nullopt;
+
+    if (!S_ISLNK(scriptSt->st_mode))
+        throw BuildError(
+            BuildResult::Failure::OutputRejected,
+            "relocate.sh in '%s' must be a symlink to a store path",
+            storeCfg.printStorePath(scratchPath));
+
+    std::string linkTarget = readLink(relocateScriptPath).native();
+    auto [relocatorStorePath, relSubPath] = [&]() {
+        try {
+            return storeCfg.toStorePath(linkTarget);
+        } catch (Error & e) {
+            throw BuildError(
+                BuildResult::Failure::OutputRejected,
+                "relocate.sh in '%s' must point to a valid store path (got '%s'): %s",
+                storeCfg.printStorePath(scratchPath),
+                linkTarget,
+                e.what());
+        }
+    }();
+
+    std::string subPathStr{relSubPath.rel()};
+    std::string canonicalTarget = storeCfg.printStorePath(relocatorStorePath);
+    if (!subPathStr.empty())
+        canonicalTarget += "/" + subPathStr;
+    if (linkTarget != canonicalTarget)
+        throw BuildError(
+            BuildResult::Failure::OutputRejected,
+            "relocate.sh in '%s' must be a canonical store path without '..' or redundant slashes (got '%s', expected '%s')",
+            storeCfg.printStorePath(scratchPath),
+            linkTarget,
+            canonicalTarget);
+
+    if (scratchOutputsInverse.contains(relocatorStorePath))
+        throw BuildError(
+            BuildResult::Failure::OutputRejected,
+            "relocate.sh in '%s' must point to an existing dependency store path, not an output of the current derivation ('%s')",
+            storeCfg.printStorePath(scratchPath),
+            linkTarget);
+
+    if (!referenceablePaths.contains(relocatorStorePath) || !localStore.isValidPath(relocatorStorePath))
+        throw BuildError(
+            BuildResult::Failure::OutputRejected,
+            "relocate.sh target '%s' in '%s' is not a valid declared input store path",
+            storeCfg.printStorePath(relocatorStorePath),
+            storeCfg.printStorePath(scratchPath));
+
+    if (hasPrefix(relocatorStorePath.name(), outBaseName))
+        throw BuildError(
+            BuildResult::Failure::OutputRejected,
+            "relocate.sh target '%s' in '%s' must not start with the output store path name '%s'",
+            storeCfg.printStorePath(relocatorStorePath),
+            storeCfg.printStorePath(scratchPath),
+            outBaseName);
+
+    std::filesystem::path hostExecPath = localStore.toRealPath(relocatorStorePath);
+    if (!subPathStr.empty())
+        hostExecPath /= subPathStr;
+    if (!pathExists(hostExecPath))
+        throw BuildError(
+            BuildResult::Failure::OutputRejected,
+            "relocate.sh target '%s' in '%s' does not exist",
+            linkTarget,
+            storeCfg.printStorePath(scratchPath));
+
+    StorePathSet closure;
+    localStore.computeFSClosure(relocatorStorePath, closure);
+
+    return OutputRelocatorInfo{
+        .linkTarget = std::move(linkTarget),
+        .storePath = std::move(relocatorStorePath),
+        .subPath = std::move(subPathStr),
+        .closure = std::move(closure),
+    };
+}
+
+} // namespace
+
 SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
 {
     std::map<std::string, ValidPathInfo> infos;
@@ -361,16 +564,33 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                         siblingPaths.insert(sibPath);
                 NullSink blank;
                 references = scanForReferences(blank, actualPath, siblingPaths);
-                if (!siblingPaths.empty() && S_ISDIR(st.st_mode)
-                    && pathExists(actualPath / "nix-support" / "relocate.sh")) {
-                    PathRefScanSink sibExtraScan = PathRefScanSink::fromPaths(siblingPaths);
-                    NullSink blankNarOut;
-                    auto dumpSrc = sinkToSource([&](Sink & dumpSink) {
-                        dumpPath(actualPath, dumpSink);
-                    });
-                    runRelocateScript(*scratchOutput, "", "", *dumpSrc, blankNarOut, &sibExtraScan);
-                    for (auto & r : sibExtraScan.getResultPaths())
-                        references.insert(r);
+                if (!siblingPaths.empty() && S_ISDIR(st.st_mode)) {
+                    if (auto reloc = inspectOutputRelocator(
+                            localStore,
+                            *store,
+                            *scratchOutput,
+                            actualPath,
+                            scratchOutput->name(),
+                            referenceablePaths,
+                            scratchOutputsInverse)) {
+                        PathRefScanSink sibExtraScan = PathRefScanSink::fromPaths(siblingPaths);
+                        NullSink blankNarOut;
+                        auto dumpSrc = sinkToSource([&](Sink & dumpSink) {
+                            dumpPath(actualPath, dumpSink);
+                        });
+                        runRelocateScript(
+                            *scratchOutput,
+                            reloc->storePath,
+                            reloc->subPath,
+                            reloc->closure,
+                            "",
+                            "",
+                            *dumpSrc,
+                            blankNarOut,
+                            &sibExtraScan);
+                        for (auto & r : sibExtraScan.getResultPaths())
+                            references.insert(r);
+                    }
                 }
             }
         } else {
@@ -645,11 +865,6 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
 
                 [&](const DerivationOutput::InputAddressed & output) {
                     /* CASPER: Pure NAR -> NAR Stream Blinding & Embedded Relocation */
-                    auto rootSt = lstat(actualPath);
-                    auto relocateScriptPath = actualPath / "nix-support" / "relocate.sh";
-                    bool hasCustomRelocate =
-                        S_ISDIR(rootSt.st_mode) && pathExists(relocateScriptPath);
-
                     bool discardReferences = false;
                     if (auto udr = get(drvOptions.unsafeDiscardReferences, outputName))
                         discardReferences = *udr;
@@ -658,37 +873,18 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                     std::string oldSelf{scratchPath->to_string()};
                     std::string blindSelf;
 
+                    auto optReloc = inspectOutputRelocator(
+                        localStore,
+                        *store,
+                        *scratchPath,
+                        actualPath,
+                        outBaseName,
+                        referenceablePaths,
+                        scratchOutputsInverse);
+                    bool hasCustomRelocate = optReloc.has_value();
+
                     if (hasCustomRelocate) {
-                        auto scriptSt = lstat(relocateScriptPath);
-                        if (!S_ISLNK(scriptSt.st_mode))
-                            throw BuildError(
-                                BuildResult::Failure::OutputRejected,
-                                "relocate.sh in '%s' must be a symlink to a store path",
-                                store->printStorePath(*scratchPath));
-
-                        auto linkTarget = readLink(relocateScriptPath).native();
-                        StorePath relocatorStorePath = [&]() {
-                            try {
-                                return store->toStorePath(linkTarget).first;
-                            } catch (Error & e) {
-                                throw BuildError(
-                                    BuildResult::Failure::OutputRejected,
-                                    "relocate.sh in '%s' must point to a valid store path (got '%s'): %s",
-                                    store->printStorePath(*scratchPath),
-                                    linkTarget,
-                                    e.what());
-                            }
-                        }();
-
-                        if (hasPrefix(relocatorStorePath.name(), outBaseName))
-                            throw BuildError(
-                                BuildResult::Failure::OutputRejected,
-                                "relocate.sh target '%s' in '%s' must not start with the output store path name '%s'",
-                                store->printStorePath(relocatorStorePath),
-                                store->printStorePath(*scratchPath),
-                                outBaseName);
-
-                        blindSelf = std::string{relocatorStorePath.hashPart()} + "-" + outBaseName;
+                        blindSelf = std::string{optReloc->storePath.hashPart()} + "-" + outBaseName;
                     } else {
                         blindSelf = std::string(StorePath::HashLen, 'x') + "-" + outBaseName;
                     }
@@ -722,12 +918,31 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                             }
                             StringSource inSrc(currentNar.s);
                             StringSink nextNar;
-                            runRelocateScript(*scratchPath, sibArgs, inSrc, nextNar);
+                            runRelocateScript(
+                                *scratchPath,
+                                optReloc->storePath,
+                                optReloc->subPath,
+                                optReloc->closure,
+                                sibArgs,
+                                inSrc,
+                                nextNar);
+                            verifyRelocatorLinkInNar(
+                                *store, *scratchPath, nextNar.s, optReloc->linkTarget, "sibling relocation");
                             currentNar.s = std::move(nextNar.s);
                         }
                         prePass1Hash = hashString(HashAlgorithm::SHA256, currentNar.s);
                         StringSource inSrc(currentNar.s);
-                        runRelocateScript(*scratchPath, oldSelf, blindSelf, inSrc, pass1Tee);
+                        runRelocateScript(
+                            *scratchPath,
+                            optReloc->storePath,
+                            optReloc->subPath,
+                            optReloc->closure,
+                            oldSelf,
+                            blindSelf,
+                            inSrc,
+                            pass1Tee);
+                        verifyRelocatorLinkInNar(
+                            *store, *scratchPath, blindedNarSink.s, optReloc->linkTarget, "Pass 1 blinding");
                     } else {
                         StringMap pass1Rewrites = std::move(siblingRewrites);
                         pass1Rewrites.insert_or_assign(oldSelf, blindSelf);
@@ -777,6 +992,9 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                         if (hasCustomRelocate) {
                             runRelocateScript(
                                 *scratchPath,
+                                optReloc->storePath,
+                                optReloc->subPath,
+                                optReloc->closure,
                                 blindSelf,
                                 newSelf,
                                 blindedSource,
@@ -792,6 +1010,9 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                     restorePath(tmpOutput, *relocatedSource, store->getLocalSettings().fsyncStorePaths);
                     deletePath(actualPath);
                     movePath(tmpOutput, actualPath);
+
+                    if (hasCustomRelocate)
+                        verifyUnpackedRelocatorLink(*store, *scratchPath, actualPath, optReloc->linkTarget);
 
                     HashResult narHashAndSize = finalNarHashSink.finish();
 
@@ -814,7 +1035,15 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                             StringSink pass2Nar;
                             dumpPath(actualPath, pass2Nar);
                             StringSource pass3In(pass2Nar.s);
-                            runRelocateScript(*scratchPath, newSelf, blindSelf, pass3In, pass3HashSink);
+                            runRelocateScript(
+                                *scratchPath,
+                                optReloc->storePath,
+                                optReloc->subPath,
+                                optReloc->closure,
+                                newSelf,
+                                blindSelf,
+                                pass3In,
+                                pass3HashSink);
                         } else {
                             auto pass3DumpSource = sinkToSource([&](Sink & dumpSink) {
                                 dumpPath(actualPath, dumpSink);

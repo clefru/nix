@@ -6,6 +6,7 @@
 #include "nix/store/local-fs-store.hh"
 #include "nix/store/store-open.hh"
 #include "nix/util/archive.hh"
+#include "nix/util/fs-sink.hh"
 #include "nix/util/git.hh"
 #include "nix/util/processes.hh"
 #include "nix/util/source-accessor.hh"
@@ -21,6 +22,50 @@
 #endif
 
 namespace nix {
+
+namespace {
+
+struct VerifyRelocatorLinkCheckSink : NullFileSystemObjectSink
+{
+    bool rootIsDir = false;
+    bool nixSupportIsDir = false;
+    bool seenRelocateSymlink = false;
+    bool seenNonSymlinkRelocate = false;
+    std::string relocateTarget;
+
+    void createDirectory(const CanonPath & path) override
+    {
+        if (path.isRoot())
+            rootIsDir = true;
+        else if (path.rel() == "nix-support")
+            nixSupportIsDir = true;
+        else if (path.rel() == "nix-support/relocate.sh")
+            seenNonSymlinkRelocate = true;
+    }
+
+    void createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> cb) override
+    {
+        if (path.rel() == "nix-support/relocate.sh")
+            seenNonSymlinkRelocate = true;
+        NullFileSystemObjectSink::createRegularFile(path, std::move(cb));
+    }
+
+    void createSymlink(const CanonPath & path, const std::string & target) override
+    {
+        if (path.rel() == "nix-support/relocate.sh") {
+            seenRelocateSymlink = true;
+            relocateTarget = target;
+        }
+    }
+
+    bool matchesExpected(std::string_view expectedTarget) const
+    {
+        return rootIsDir && nixSupportIsDir && !seenNonSymlinkRelocate && seenRelocateSymlink
+            && relocateTarget == expectedTarget;
+    }
+};
+
+} // namespace
 
 static void verifyCasperPath(const std::string & pathStr, std::shared_ptr<Store> store = nullptr)
 {
@@ -46,7 +91,7 @@ static void verifyCasperPath(const std::string & pathStr, std::shared_ptr<Store>
         optSp = sp;
     }
 
-    if (!pathExists(realPath))
+    if (!maybeLstat(realPath))
         throw Error("path '%s' does not exist", PathFmt(realPath));
 
     StorePath sp = *optSp;
@@ -54,9 +99,21 @@ static void verifyCasperPath(const std::string & pathStr, std::shared_ptr<Store>
     std::string outBaseName{sp.name()};
 
     auto rootSt = lstat(realPath);
-    auto relocateScriptPath = realPath / "nix-support" / "relocate.sh";
-    bool hasCustomRelocate =
-        S_ISDIR(rootSt.st_mode) && pathExists(relocateScriptPath);
+    bool hasCustomRelocate = false;
+    std::filesystem::path relocateScriptPath = realPath / "nix-support" / "relocate.sh";
+    if (S_ISDIR(rootSt.st_mode)) {
+        auto nixSupportPath = realPath / "nix-support";
+        if (auto nixSupportSt = maybeLstat(nixSupportPath)) {
+            if (S_ISDIR(nixSupportSt->st_mode)) {
+                if (maybeLstat(relocateScriptPath))
+                    hasCustomRelocate = true;
+            } else if (S_ISLNK(nixSupportSt->st_mode) && maybeLstat(relocateScriptPath)) {
+                throw Error(
+                    "CASPER verification failed for '%s': 'nix-support' must be a real directory when 'relocate.sh' is present, not a symlink",
+                    PathFmt(realPath));
+            }
+        }
+    }
 
     std::string blindSelf;
     HashSink blindedHashSink(HashAlgorithm::SHA256);
@@ -70,6 +127,21 @@ static void verifyCasperPath(const std::string & pathStr, std::shared_ptr<Store>
 
         auto linkTarget = readLink(relocateScriptPath).native();
         auto [relocatorStorePath, relSubPath] = storeCfg.toStorePath(linkTarget);
+
+        std::string canonicalTarget = storeCfg.printStorePath(relocatorStorePath);
+        if (!relSubPath.isRoot())
+            canonicalTarget += "/" + std::string{relSubPath.rel()};
+        if (linkTarget != canonicalTarget)
+            throw Error(
+                "CASPER verification failed for '%s': relocate.sh target '%s' is not canonical (expected '%s')",
+                PathFmt(realPath),
+                linkTarget,
+                canonicalTarget);
+
+        if (relocatorStorePath == sp)
+            throw Error(
+                "CASPER verification failed for '%s': relocate.sh cannot point to the output store path itself",
+                PathFmt(realPath));
 
         if (hasPrefix(relocatorStorePath.name(), outBaseName))
             throw Error(
@@ -90,6 +162,16 @@ static void verifyCasperPath(const std::string & pathStr, std::shared_ptr<Store>
                 PathFmt(realPath),
                 linkTarget,
                 PathFmt(relocatorExec));
+
+        std::optional<StorePathSet> optClosure;
+        if (store && store->isValidPath(relocatorStorePath)) {
+            StorePathSet c;
+            store->computeFSClosure(relocatorStorePath, c);
+            optClosure = std::move(c);
+        }
+
+        std::filesystem::path verifyTmpDir = createTempDir();
+        AutoDelete delVerifyTmpDir(verifyTmpDir, true);
 
         Pipe inPipe, outPipe, errPipe;
         inPipe.create();
@@ -113,36 +195,144 @@ static void verifyCasperPath(const std::string & pathStr, std::shared_ptr<Store>
                 outPipe.writeSide.close();
                 errPipe.writeSide.close();
 
-                std::string extraPath = "/bin:/usr/bin:/run/current-system/sw/bin";
-                for (auto & entry : DirectoryIterator{realStoreDir}) {
-                    auto name = entry.path().filename().native();
-                    if (name.find("-coreutils-") != std::string::npos
-                        || name.find("-gnused-") != std::string::npos
-                        || name.find("-gnugrep-") != std::string::npos
-                        || name.find("-findutils-") != std::string::npos
-                        || name.find("-gzip-") != std::string::npos
-                        || name.find("-bash-") != std::string::npos) {
-                        auto binPath = entry.path() / "bin";
-                        if (pathExists(binPath))
-                            extraPath += ":" + binPath.native();
+                unix::closeExtraFDs();
+
+                std::filesystem::path activeStoreDir = realStoreDir;
+                std::filesystem::path activeExec = relocatorExec;
+                std::string activeTmp = verifyTmpDir.native();
+
+#ifdef __linux__
+                uid_t origUid = getuid();
+                gid_t origGid = getgid();
+                if (unshare(CLONE_NEWUSER | CLONE_NEWNS) == 0) {
+                    try {
+                        writeFile("/proc/self/setgroups", "deny");
+                    } catch (...) {
                     }
+                    try {
+                        writeFile("/proc/self/uid_map", fmt("%d %d 1", origUid, origUid));
+                        writeFile("/proc/self/gid_map", fmt("%d %d 1", origGid, origGid));
+                    } catch (...) {
+                    }
+                    if (mount(0, "/", 0, MS_PRIVATE | MS_REC, 0) == 0) {
+                        if (pathExists("/tmp") && mount("none", "/tmp", "tmpfs", 0, "mode=1777") == 0)
+                            activeTmp = "/tmp";
+                        if (optClosure && pathExists("/nix/store")
+                            && mount("none", "/nix/store", "tmpfs", 0, "mode=0755") == 0) {
+                            bool allMounted = true;
+                            for (const auto & p : *optClosure) {
+                                auto srcP = realStoreDir / std::string{p.to_string()};
+                                auto dstP = std::filesystem::path("/nix/store") / std::string{p.to_string()};
+                                auto stOpt = maybeLstat(srcP);
+                                if (!stOpt) {
+                                    allMounted = false;
+                                    break;
+                                }
+                                if (S_ISDIR(stOpt->st_mode)) {
+                                    createDirs(dstP);
+                                    if (mount(srcP.c_str(), dstP.c_str(), 0, MS_BIND | MS_REC, 0) == -1) {
+                                        allMounted = false;
+                                        break;
+                                    }
+                                } else if (S_ISLNK(stOpt->st_mode)) {
+                                    createSymlink(readLink(srcP), dstP);
+                                } else {
+                                    writeFile(dstP, "");
+                                    if (mount(srcP.c_str(), dstP.c_str(), 0, MS_BIND, 0) == -1) {
+                                        allMounted = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (allMounted) {
+                                mount(
+                                    "none",
+                                    "/nix/store",
+                                    "tmpfs",
+                                    MS_REMOUNT | MS_RDONLY | MS_NODEV | MS_NOSUID,
+                                    "mode=0555");
+                                activeStoreDir = "/nix/store";
+                                activeExec = canonicalTarget;
+                            }
+                        }
+                    }
+                }
+#endif
+                if (chdir(activeTmp.c_str()) == -1) {
+                    // non-fatal
+                }
+
+                std::string extraPath;
+                std::string fallbackShell = "/bin/sh";
+                if (optClosure) {
+                    for (const auto & p : *optClosure) {
+                        auto binPath = activeStoreDir / std::string{p.to_string()} / "bin";
+                        if (pathExists(binPath)) {
+                            if (!extraPath.empty())
+                                extraPath += ":";
+                            extraPath += binPath.native();
+                            if (fallbackShell == "/bin/sh") {
+                                for (auto * shName : {"sh", "bash", "ash", "dash"}) {
+                                    auto cand = binPath / shName;
+                                    if (pathExists(cand)) {
+                                        fallbackShell = cand.native();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (!extraPath.empty())
+                        extraPath += ":/bin:/usr/bin";
+                    else
+                        extraPath = "/bin:/usr/bin";
+                } else {
+                    for (auto & entry : DirectoryIterator{activeStoreDir}) {
+                        auto name = entry.path().filename().native();
+                        if (name.find("-coreutils-") != std::string::npos
+                            || name.find("-gnused-") != std::string::npos
+                            || name.find("-gnugrep-") != std::string::npos
+                            || name.find("-findutils-") != std::string::npos
+                            || name.find("-gzip-") != std::string::npos
+                            || name.find("-bash-") != std::string::npos) {
+                            auto binPath = entry.path() / "bin";
+                            if (pathExists(binPath)) {
+                                if (!extraPath.empty())
+                                    extraPath += ":";
+                                extraPath += binPath.native();
+                            }
+                        }
+                    }
+                    if (!extraPath.empty())
+                        extraPath += ":/bin:/usr/bin:/run/current-system/sw/bin";
+                    else
+                        extraPath = "/bin:/usr/bin:/run/current-system/sw/bin";
                 }
 
                 Strings directArgs{
-                    relocatorExec.native(),
+                    activeExec.native(),
                     currentSelf,
                     blindSelf,
                 };
-                Strings envStrs{"LC_ALL=C", "PATH=" + extraPath};
-                execve(relocatorExec.c_str(), stringsToCharPtrs(directArgs).data(), stringsToCharPtrs(envStrs).data());
+                Strings envStrs{
+                    "LC_ALL=C",
+                    "HOME=/homeless-shelter",
+                    "PATH=" + extraPath,
+                    "TMPDIR=" + activeTmp,
+                    "TEMPDIR=" + activeTmp,
+                    "TMP=" + activeTmp,
+                    "TEMP=" + activeTmp,
+                };
+                execve(activeExec.c_str(), stringsToCharPtrs(directArgs).data(), stringsToCharPtrs(envStrs).data());
 
+                std::string shellToExec = pathExists("/bin/sh") ? "/bin/sh" : fallbackShell;
                 Strings shArgs{
                     "sh",
-                    relocatorExec.native(),
+                    activeExec.native(),
                     currentSelf,
                     blindSelf,
                 };
-                execve("/bin/sh", stringsToCharPtrs(shArgs).data(), stringsToCharPtrs(envStrs).data());
+                execve(shellToExec.c_str(), stringsToCharPtrs(shArgs).data(), stringsToCharPtrs(envStrs).data());
             } catch (...) {
             }
             _exit(1);
@@ -176,10 +366,12 @@ static void verifyCasperPath(const std::string & pathStr, std::shared_ptr<Store>
             errPipe.readSide.close();
         });
 
+        VerifyRelocatorLinkCheckSink checkSink;
         std::exception_ptr readerException;
         try {
             FdSource outSource(outPipe.readSide.get());
-            copyNAR(outSource, blindedHashSink);
+            TeeSource wrapper{outSource, blindedHashSink};
+            parseDump(checkSink, wrapper);
         } catch (...) {
             readerException = std::current_exception();
         }
@@ -200,6 +392,12 @@ static void verifyCasperPath(const std::string & pathStr, std::shared_ptr<Store>
             std::rethrow_exception(writerException);
         if (readerException)
             std::rethrow_exception(readerException);
+        if (!checkSink.matchesExpected(linkTarget))
+            throw Error(
+                "CASPER verification failed for '%s': blinded NAR must preserve real directory 'nix-support' and symlink 'nix-support/relocate.sh' -> '%s' (got %s)",
+                PathFmt(realPath),
+                linkTarget,
+                checkSink.seenRelocateSymlink ? "'" + checkSink.relocateTarget + "'" : "<missing or non-symlink>");
     } else {
         blindSelf = std::string(StorePath::HashLen, 'x') + "-" + outBaseName;
         auto dumpSource = sinkToSource([&](Sink & dumpSink) {

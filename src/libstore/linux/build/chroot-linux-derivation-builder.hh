@@ -68,6 +68,9 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
 
     void runRelocateScript(
         const StorePath & scratchPath,
+        const StorePath & relocatorStorePath,
+        const std::string & relocatorSubPath,
+        const StorePathSet & relocClosure,
         const Strings & relocArgs,
         Source & narIn,
         Sink & narOut,

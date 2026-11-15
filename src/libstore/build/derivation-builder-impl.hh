@@ -96,14 +96,18 @@ protected:
     }
 
     /**
-     * Execute `$out/nix-support/relocate.sh` inside the builder
-     * environment / sandbox with `relocArgs` (either `<old> <new>` or
-     * `<old1>:<new1> <old2>:<new2> ...`), streaming a NAR from `narIn`
-     * (stdin) to `narOut` (stdout), and optionally draining decoded
-     * hidden-reference streams from FD 3 into `scanOut`.
+     * Execute the verified relocator target of `$out/nix-support/relocate.sh`
+     * inside an isolated closure-bound environment (`relocClosure` only, never
+     * inheriting `drv.env`, `drv.inputPaths`, `/build`, or `drv.builder`) with
+     * `relocArgs` (either `<old> <new>` or `<old1>:<new1> <old2>:<new2> ...`),
+     * streaming a NAR from `narIn` (stdin) to `narOut` (stdout), and optionally
+     * draining decoded hidden-reference streams from FD 3 into `scanOut`.
      */
     virtual void runRelocateScript(
         const StorePath & scratchPath,
+        const StorePath & relocatorStorePath,
+        const std::string & relocatorSubPath,
+        const StorePathSet & relocClosure,
         const Strings & relocArgs,
         Source & narIn,
         Sink & narOut,
@@ -113,6 +117,9 @@ protected:
 
     void runRelocateScript(
         const StorePath & scratchPath,
+        const StorePath & relocatorStorePath,
+        const std::string & relocatorSubPath,
+        const StorePathSet & relocClosure,
         std::string_view oldSelf,
         std::string_view newSelf,
         Source & narIn,
@@ -121,6 +128,9 @@ protected:
     {
         runRelocateScript(
             scratchPath,
+            relocatorStorePath,
+            relocatorSubPath,
+            relocClosure,
             Strings{std::string(oldSelf), std::string(newSelf)},
             narIn,
             narOut,
