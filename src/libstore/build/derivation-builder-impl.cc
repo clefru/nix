@@ -361,6 +361,17 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                         siblingPaths.insert(sibPath);
                 NullSink blank;
                 references = scanForReferences(blank, actualPath, siblingPaths);
+                if (!siblingPaths.empty() && S_ISDIR(st.st_mode)
+                    && pathExists(actualPath / "nix-support" / "relocate.sh")) {
+                    PathRefScanSink sibExtraScan = PathRefScanSink::fromPaths(siblingPaths);
+                    NullSink blankNarOut;
+                    auto dumpSrc = sinkToSource([&](Sink & dumpSink) {
+                        dumpPath(actualPath, dumpSink);
+                    });
+                    runRelocateScript(*scratchOutput, "", "", *dumpSrc, blankNarOut, &sibExtraScan);
+                    for (auto & r : sibExtraScan.getResultPaths())
+                        references.insert(r);
+                }
             }
         } else {
             debug("scanning for references for output '%s' in temp location %s", outputName, PathFmt(actualPath));
@@ -700,10 +711,18 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                     if (hasCustomRelocate) {
                         StringSink currentNar;
                         dumpPath(actualPath, currentNar);
-                        for (auto & [oldSib, newSib] : siblingRewrites) {
+                        if (!siblingRewrites.empty()) {
+                            Strings sibArgs;
+                            if (siblingRewrites.size() == 1) {
+                                auto & [oldSib, newSib] = *siblingRewrites.begin();
+                                sibArgs = {oldSib, newSib};
+                            } else {
+                                for (auto & [oldSib, newSib] : siblingRewrites)
+                                    sibArgs.push_back(oldSib + ":" + newSib);
+                            }
                             StringSource inSrc(currentNar.s);
                             StringSink nextNar;
-                            runRelocateScript(*scratchPath, oldSib, newSib, inSrc, nextNar);
+                            runRelocateScript(*scratchPath, sibArgs, inSrc, nextNar);
                             currentNar.s = std::move(nextNar.s);
                         }
                         prePass1Hash = hashString(HashAlgorithm::SHA256, currentNar.s);
@@ -744,6 +763,7 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                     }
 
                     PathRefScanSink postRelocRefScan = PathRefScanSink::fromPaths(postRelocCandidateRefs);
+                    PathRefScanSink extraRefScan = PathRefScanSink::fromPaths(postRelocCandidateRefs);
                     HashSink finalNarHashSink(HashAlgorithm::SHA256);
 
                     auto [relocTempDir, relocTempDirFd] = localStore.createTempDirInStore();
@@ -755,7 +775,13 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                         TeeSink tee2(tee1, postRelocRefScan);
                         StringSource blindedSource(blindedNarSink.s);
                         if (hasCustomRelocate) {
-                            runRelocateScript(*scratchPath, blindSelf, newSelf, blindedSource, tee2);
+                            runRelocateScript(
+                                *scratchPath,
+                                blindSelf,
+                                newSelf,
+                                blindedSource,
+                                tee2,
+                                discardReferences ? nullptr : &extraRefScan);
                         } else {
                             relocateNAR(
                                 blindedSource,
@@ -816,6 +842,8 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
 
                     if (!discardReferences) {
                         newInfo0.references = postRelocRefScan.getResultPaths();
+                        for (auto & p : extraRefScan.getResultPaths())
+                            newInfo0.references.insert(p);
                         if (narHashAndSize.hash != normalizedNar.hash)
                             newInfo0.references.insert(newInfo0.path);
                     }

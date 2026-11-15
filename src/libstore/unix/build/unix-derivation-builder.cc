@@ -989,12 +989,12 @@ void UnixDerivationBuilderImpl::execBuilder(const Strings & args, const Strings 
 
 void UnixDerivationBuilderImpl::runRelocateScript(
     const StorePath & scratchPath,
-    std::string_view oldSelf,
-    std::string_view newSelf,
+    const Strings & relocArgs,
     Source & narIn,
-    Sink & narOut)
+    Sink & narOut,
+    Sink * scanOut)
 {
-    if (oldSelf.empty() || oldSelf == newSelf) {
+    if (!scanOut && !hasActiveRelocArgs(relocArgs)) {
         copyNAR(narIn, narOut);
         return;
     }
@@ -1006,16 +1006,20 @@ void UnixDerivationBuilderImpl::runRelocateScript(
         return;
     }
 
-    Pipe inPipe, outPipe, errPipe;
+    Pipe inPipe, outPipe, errPipe, scanPipe;
     inPipe.create();
     outPipe.create();
     errPipe.create();
+    if (scanOut)
+        scanPipe.create();
 
     Pid child(startProcess([&]() {
         try {
             inPipe.writeSide.close();
             outPipe.readSide.close();
             errPipe.readSide.close();
+            if (scanOut)
+                scanPipe.readSide.close();
 
             if (dup2(inPipe.readSide.get(), STDIN_FILENO) == -1)
                 _exit(1);
@@ -1028,7 +1032,22 @@ void UnixDerivationBuilderImpl::runRelocateScript(
             outPipe.writeSide.close();
             errPipe.writeSide.close();
 
-            unix::closeExtraFDs();
+            if (scanOut) {
+                if (scanPipe.writeSide.get() != 3) {
+                    if (dup2(scanPipe.writeSide.get(), 3) == -1)
+                        _exit(1);
+                    scanPipe.writeSide.close();
+                } else {
+                    int flags = fcntl(3, F_GETFD);
+                    if (flags == -1 || fcntl(3, F_SETFD, flags & ~FD_CLOEXEC) == -1)
+                        _exit(1);
+                    scanPipe.writeSide.release();
+                }
+                const Descriptor keep[] = {3};
+                unix::closeExtraFDs(keep);
+            } else {
+                unix::closeExtraFDs();
+            }
             setUser();
 
             Strings envStrs;
@@ -1049,11 +1068,9 @@ void UnixDerivationBuilderImpl::runRelocateScript(
             if (!hasPath && !extraPath.empty())
                 envStrs.push_back("PATH=" + extraPath);
 
-            Strings directArgs{
-                scriptPath.native(),
-                std::string(oldSelf),
-                std::string(newSelf),
-            };
+            Strings directArgs{scriptPath.native()};
+            for (auto & a : relocArgs)
+                directArgs.push_back(a);
             execve(scriptPath.c_str(), stringsToCharPtrs(directArgs).data(), stringsToCharPtrs(envStrs).data());
 
             std::string shell = "/bin/sh";
@@ -1064,12 +1081,9 @@ void UnixDerivationBuilderImpl::runRelocateScript(
                 shell = drv.builder;
             }
 
-            Strings args{
-                "sh",
-                scriptPath.native(),
-                std::string(oldSelf),
-                std::string(newSelf),
-            };
+            Strings args{"sh", scriptPath.native()};
+            for (auto & a : relocArgs)
+                args.push_back(a);
             execve(shell.c_str(), stringsToCharPtrs(args).data(), stringsToCharPtrs(envStrs).data());
         } catch (...) {
         }
@@ -1079,6 +1093,8 @@ void UnixDerivationBuilderImpl::runRelocateScript(
     inPipe.readSide.close();
     outPipe.writeSide.close();
     errPipe.writeSide.close();
+    if (scanOut)
+        scanPipe.writeSide.close();
 
     std::exception_ptr writerException;
     std::thread writerThread([&]() {
@@ -1104,6 +1120,19 @@ void UnixDerivationBuilderImpl::runRelocateScript(
         errPipe.readSide.close();
     });
 
+    std::exception_ptr scanException;
+    std::thread scanThread;
+    if (scanOut) {
+        scanThread = std::thread([&]() {
+            try {
+                drainFD(scanPipe.readSide.get(), *scanOut);
+            } catch (...) {
+                scanException = std::current_exception();
+            }
+            scanPipe.readSide.close();
+        });
+    }
+
     std::exception_ptr readerException;
     try {
         FdSource outSource(outPipe.readSide.get());
@@ -1115,6 +1144,8 @@ void UnixDerivationBuilderImpl::runRelocateScript(
 
     writerThread.join();
     errThread.join();
+    if (scanThread.joinable())
+        scanThread.join();
 
     int status = child.wait();
     killSandbox(false);
@@ -1132,6 +1163,8 @@ void UnixDerivationBuilderImpl::runRelocateScript(
         std::rethrow_exception(writerException);
     if (readerException)
         std::rethrow_exception(readerException);
+    if (scanException)
+        std::rethrow_exception(scanException);
 }
 
 void UnixDerivationBuilderImpl::cleanupBuild(bool force)

@@ -254,12 +254,14 @@ protected:
 
     void addDependencyImpl(const StorePath & path) override;
 
+    using DerivationBuilderImpl::runRelocateScript;
+
     void runRelocateScript(
         const StorePath & scratchPath,
-        std::string_view oldSelf,
-        std::string_view newSelf,
+        const Strings & relocArgs,
         Source & narIn,
-        Sink & narOut) override;
+        Sink & narOut,
+        Sink * scanOut = nullptr) override;
 
     /**
      * Make a file owned by the builder.

@@ -1016,18 +1016,18 @@ void ChrootLinuxDerivationBuilder::addDependencyImpl(const StorePath & path)
 
 void ChrootLinuxDerivationBuilder::runRelocateScript(
     const StorePath & scratchPath,
-    std::string_view oldSelf,
-    std::string_view newSelf,
+    const Strings & relocArgs,
     Source & narIn,
-    Sink & narOut)
+    Sink & narOut,
+    Sink * scanOut)
 {
-    if (oldSelf.empty() || oldSelf == newSelf) {
+    if (!scanOut && !hasActiveRelocArgs(relocArgs)) {
         copyNAR(narIn, narOut);
         return;
     }
 
     if (sandboxMountNamespace.get() == -1) {
-        UnixDerivationBuilderImpl::runRelocateScript(scratchPath, oldSelf, newSelf, narIn, narOut);
+        UnixDerivationBuilderImpl::runRelocateScript(scratchPath, relocArgs, narIn, narOut, scanOut);
         return;
     }
 
@@ -1037,16 +1037,20 @@ void ChrootLinuxDerivationBuilder::runRelocateScript(
         return;
     }
 
-    Pipe inPipe, outPipe, errPipe;
+    Pipe inPipe, outPipe, errPipe, scanPipe;
     inPipe.create();
     outPipe.create();
     errPipe.create();
+    if (scanOut)
+        scanPipe.create();
 
     Pid child(startProcess([&]() {
         try {
             inPipe.writeSide.close();
             outPipe.readSide.close();
             errPipe.readSide.close();
+            if (scanOut)
+                scanPipe.readSide.close();
 
             if (dup2(inPipe.readSide.get(), STDIN_FILENO) == -1)
                 _exit(1);
@@ -1073,7 +1077,22 @@ void ChrootLinuxDerivationBuilder::runRelocateScript(
             if (chroot(".") == -1)
                 _exit(1);
 
-            unix::closeExtraFDs();
+            if (scanOut) {
+                if (scanPipe.writeSide.get() != 3) {
+                    if (dup2(scanPipe.writeSide.get(), 3) == -1)
+                        _exit(1);
+                    scanPipe.writeSide.close();
+                } else {
+                    int flags = fcntl(3, F_GETFD);
+                    if (flags == -1 || fcntl(3, F_SETFD, flags & ~FD_CLOEXEC) == -1)
+                        _exit(1);
+                    scanPipe.writeSide.release();
+                }
+                const Descriptor keep[] = {3};
+                unix::closeExtraFDs(keep);
+            } else {
+                unix::closeExtraFDs();
+            }
             LinuxDerivationBuilder::enterChroot();
             setUser();
 
@@ -1106,11 +1125,9 @@ void ChrootLinuxDerivationBuilder::runRelocateScript(
             if (!hasPath && !extraPath.empty())
                 envStrs.push_back("PATH=" + extraPath);
 
-            Strings directArgs{
-                scriptInSandbox,
-                std::string(oldSelf),
-                std::string(newSelf),
-            };
+            Strings directArgs{scriptInSandbox};
+            for (auto & a : relocArgs)
+                directArgs.push_back(a);
             execve(scriptInSandbox.c_str(), stringsToCharPtrs(directArgs).data(), stringsToCharPtrs(envStrs).data());
 
             std::string shell = "/bin/sh";
@@ -1121,12 +1138,9 @@ void ChrootLinuxDerivationBuilder::runRelocateScript(
                 shell = drv.builder;
             }
 
-            Strings args{
-                "sh",
-                scriptInSandbox,
-                std::string(oldSelf),
-                std::string(newSelf),
-            };
+            Strings args{"sh", scriptInSandbox};
+            for (auto & a : relocArgs)
+                args.push_back(a);
             execve(shell.c_str(), stringsToCharPtrs(args).data(), stringsToCharPtrs(envStrs).data());
         } catch (...) {
         }
@@ -1136,6 +1150,8 @@ void ChrootLinuxDerivationBuilder::runRelocateScript(
     inPipe.readSide.close();
     outPipe.writeSide.close();
     errPipe.writeSide.close();
+    if (scanOut)
+        scanPipe.writeSide.close();
 
     std::exception_ptr writerException;
     std::thread writerThread([&]() {
@@ -1161,6 +1177,19 @@ void ChrootLinuxDerivationBuilder::runRelocateScript(
         errPipe.readSide.close();
     });
 
+    std::exception_ptr scanException;
+    std::thread scanThread;
+    if (scanOut) {
+        scanThread = std::thread([&]() {
+            try {
+                drainFD(scanPipe.readSide.get(), *scanOut);
+            } catch (...) {
+                scanException = std::current_exception();
+            }
+            scanPipe.readSide.close();
+        });
+    }
+
     std::exception_ptr readerException;
     try {
         FdSource outSource(outPipe.readSide.get());
@@ -1172,6 +1201,8 @@ void ChrootLinuxDerivationBuilder::runRelocateScript(
 
     writerThread.join();
     errThread.join();
+    if (scanThread.joinable())
+        scanThread.join();
 
     int status = child.wait();
     killSandbox(false);
@@ -1189,6 +1220,8 @@ void ChrootLinuxDerivationBuilder::runRelocateScript(
         std::rethrow_exception(writerException);
     if (readerException)
         std::rethrow_exception(readerException);
+    if (scanException)
+        std::rethrow_exception(scanException);
 }
 
 } // namespace nix
